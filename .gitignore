@@ -42,3 +42,4 @@ cmake_install.cmake
 # OS
 .DS_Store
 Thumbs.db
+.venv/
