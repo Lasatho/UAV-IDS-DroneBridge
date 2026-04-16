@@ -1,0 +1,3 @@
+[submodule "simulation/dronebridge"]
+	path = simulation/dronebridge
+	url = https://github.com/Lasatho/DroneBridge.git
