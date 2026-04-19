@@ -60,7 +60,7 @@ services:
     image: alpine/socat
     container_name: uav_ids_socat
     network_mode: host
-    command: TCP:127.0.0.1:5751,retry=5,interval=1 TCP:127.0.0.1:5760,retry=5,interval=1
+    command: TCP:127.0.0.1:5751 TCP:127.0.0.1:5760
     depends_on:
       - ardupilot
       - dronebridge_uav
