@@ -1,0 +1,90 @@
+version: "3.8"
+
+services:
+
+  gazebo:
+    build: ./simulation/gazebo
+    container_name: uav_ids_gazebo
+    privileged: true
+    network_mode: host
+    environment:
+      - GZ_SIM_SYSTEM_PLUGIN_PATH=/usr/local/lib/ardupilot_gazebo
+      - GZ_SIM_RESOURCE_PATH=/opt/ardupilot_gazebo/models:/opt/ardupilot_gazebo/worlds
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    restart: unless-stopped
+
+  ardupilot:
+    build: ./simulation/ardupilot
+    container_name: uav_ids_ardupilot
+    privileged: true
+    network_mode: host
+    depends_on:
+      - gazebo
+    restart: unless-stopped
+
+  dronebridge_gcs:
+    build: ./simulation/dronebridge
+    container_name: uav_ids_db_gcs
+    privileged: true
+    network_mode: host
+    command: >
+      /opt/dronebridge/db_proxy
+      -n wlan1
+      -m m
+      -c 200
+      -p 5750
+      -d 1
+    depends_on:
+      - ardupilot
+    restart: unless-stopped
+
+  dronebridge_uav:
+    build: ./simulation/dronebridge
+    container_name: uav_ids_db_uav
+    privileged: true
+    network_mode: host
+    command: >
+      /opt/dronebridge/db_proxy
+      -n wlan0
+      -m m
+      -c 200
+      -p 5751
+      -d 3
+    depends_on:
+      - ardupilot
+    restart: unless-stopped
+
+  socat:
+    image: alpine/socat
+    container_name: uav_ids_socat
+    network_mode: host
+    command: TCP:127.0.0.1:5751,retry=5,interval=1 TCP:127.0.0.1:5760,retry=5,interval=1
+    depends_on:
+      - ardupilot
+      - dronebridge_uav
+    restart: unless-stopped
+
+  mavproxy:
+    build: ./simulation/mavproxy
+    container_name: uav_ids_mavproxy
+    network_mode: host
+    command: >
+      mavproxy.py
+      --master=tcp:127.0.0.1:5750
+      --out=udp:127.0.0.1:14552
+      --non-interactive
+    depends_on:
+      - dronebridge_gcs
+    restart: unless-stopped
+
+  orchestrator:
+    build: ./dataset
+    container_name: uav_ids_orchestrator
+    network_mode: host
+    volumes:
+      - ./data:/data
+    depends_on:
+      - mavproxy
+    restart: unless-stopped
