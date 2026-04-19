@@ -1,9 +1,7 @@
-version: "3.8"
-
 services:
 
   gazebo:
-    build: ./simulation/gazebo
+    build: ./gazebo
     container_name: uav_ids_gazebo
     privileged: true
     network_mode: host
@@ -16,7 +14,7 @@ services:
     restart: unless-stopped
 
   ardupilot:
-    build: ./simulation/ardupilot
+    build: ./ardupilot
     container_name: uav_ids_ardupilot
     privileged: true
     network_mode: host
@@ -25,7 +23,9 @@ services:
     restart: unless-stopped
 
   dronebridge_gcs:
-    build: ./simulation/dronebridge
+    build:
+      context: ..
+      dockerfile: simulation/dronebridge.Dockerfile
     container_name: uav_ids_db_gcs
     privileged: true
     network_mode: host
@@ -41,7 +41,9 @@ services:
     restart: unless-stopped
 
   dronebridge_uav:
-    build: ./simulation/dronebridge
+    build:
+      context: ..
+      dockerfile: simulation/dronebridge.Dockerfile
     container_name: uav_ids_db_uav
     privileged: true
     network_mode: host
@@ -60,14 +62,14 @@ services:
     image: alpine/socat
     container_name: uav_ids_socat
     network_mode: host
-    command: TCP:127.0.0.1:5751 TCP:127.0.0.1:5760
+    command: -d TCP:127.0.0.1:5751,retry=30,interval=2 TCP:127.0.0.1:5760,retry=30,interval=2
     depends_on:
       - ardupilot
       - dronebridge_uav
     restart: unless-stopped
 
   mavproxy:
-    build: ./simulation/mavproxy
+    build: ./mavproxy
     container_name: uav_ids_mavproxy
     network_mode: host
     command: >
@@ -81,7 +83,7 @@ services:
 
   orchestrator:
     build:
-      context: .
+      context: ..
       dockerfile: simulation/orchestrator/Dockerfile
     container_name: uav_ids_orchestrator
     network_mode: host

@@ -24,10 +24,14 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libgz-sim8-dev \
     rapidjson-dev \
+    libopencv-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
     && git clone https://github.com/ArduPilot/ardupilot_gazebo /opt/ardupilot_gazebo_src \
     && cmake -S /opt/ardupilot_gazebo_src -B /opt/ardupilot_gazebo_src/build \
        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     && cmake --build /opt/ardupilot_gazebo_src/build --target install \
+    && mkdir -p /opt/ardupilot_gazebo \
     && cp -r /opt/ardupilot_gazebo_src/models /opt/ardupilot_gazebo/models \
     && cp -r /opt/ardupilot_gazebo_src/worlds /opt/ardupilot_gazebo/worlds \
     && rm -rf /var/lib/apt/lists/*

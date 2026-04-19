@@ -1,13 +1,14 @@
 #!/bin/bash
 
-# ─── Cleanup ──────────────────────────────────────────────────────────────────
-echo "[*] Cleaning up..."
+# ─── Cleanup ───────────────────────────────────────────────────
+echo "[+] Cleaning up..."
 docker compose down 2>/dev/null || true
 sudo pkill -f db_proxy 2>/dev/null || true
 sudo pkill -f arducopter 2>/dev/null || true
 sudo pkill -f "gz sim" 2>/dev/null || true
 sudo pkill -f mavproxy 2>/dev/null || true
 sudo pkill -f socat 2>/dev/null || true
+
 
 # ─── Kernel: mac80211_hwsim ───────────────────────────────────────────────────
 echo "[*] Loading mac80211_hwsim..."
@@ -25,11 +26,8 @@ for iface in wlan0 wlan1 wlan2; do
 done
 sudo ip link set hwsim0 up
 
-echo "[*] Verifying interfaces..."
-for iface in wlan0 wlan1 wlan2; do
-    echo "--- $iface ---"
-    iw dev $iface info | grep -E "type|channel"
-done
+echo "[*] Interfaces ready:"
+iw dev | grep -E "Interface|type|channel"
 
 # ─── Docker ───────────────────────────────────────────────────────────────────
 echo "[*] Starting simulation stack..."

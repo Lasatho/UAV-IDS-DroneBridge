@@ -9,7 +9,8 @@ RUN apt-get update && apt-get install -y \
 
 RUN pip3 install \
     MAVProxy==1.8.74 \
-    pymavlink==2.4.49
+    pymavlink==2.4.49 \
+    future
 
 CMD ["mavproxy.py", \
      "--master=tcp:127.0.0.1:5750", \
