@@ -16,7 +16,13 @@ import sys
 import time
 from pathlib import Path
 from pymavlink import mavutil
+import logging
 
+error_logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 # Messages to log. Extend this list if additional raw sensor data is needed.
 LOGGED_MESSAGES = {
@@ -61,7 +67,7 @@ class TelemetryLogger:
             writer.writerow(["host_timestamp_ns"] + fields)
             self.files[msg_name] = f
             self.writers[msg_name] = writer
-        print(f"[+] Writing to {self.output_dir}/")
+        error_logger.info(f"[+] Writing to {self.output_dir}/")
 
     def close_files(self):
         for f in self.files.values():
@@ -75,12 +81,13 @@ class TelemetryLogger:
         self.conn.wait_heartbeat()
         print(f"[+] Heartbeat received from system "
               f"{self.conn.target_system}:{self.conn.target_component}")
+        error_logger.info(f"[+] Heartbeat received from system "
+                         f"{self.conn.target_system}:{self.conn.target_component}")
 
     def log_message(self, msg):
         """Write a single MAVLink message to its corresponding CSV."""
         msg_type = msg.get_type()
         if msg_type not in LOGGED_MESSAGES:
-            print("[!] RECIEVED UNKNOWN MESSAGE TYPE")
             return
 
         fields = LOGGED_MESSAGES[msg_type]
@@ -100,7 +107,7 @@ class TelemetryLogger:
         # some messages may not be sent at useful rates
         self.request_streams()
 
-        print(f"[*] Logging started. Press Ctrl+C to stop.")
+        error_logger.debug(f"[*] Logging started. Press Ctrl+C to stop.")
         try:
             while self.keep_running:
                 msg = self.conn.recv_match(blocking=True, timeout=1.0)
@@ -139,9 +146,9 @@ class TelemetryLogger:
     def shutdown(self):
         self.keep_running = False
         self.close_files()
-        print("\n[+] Shutdown summary:")
+        error_logger.info("\n[+] Shutdown summary:")
         for msg_name, count in self.message_counts.items():
-            print(f"    {msg_name}: {count} messages")
+            error_logger.info(f"    {msg_name}: {count} messages")
 
 
 def main():

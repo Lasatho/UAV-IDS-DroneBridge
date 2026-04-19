@@ -80,7 +80,9 @@ services:
     restart: unless-stopped
 
   orchestrator:
-    build: ./dataset
+    build:
+      context: .
+      dockerfile: simulation/orchestrator/Dockerfile
     container_name: uav_ids_orchestrator
     network_mode: host
     volumes:
