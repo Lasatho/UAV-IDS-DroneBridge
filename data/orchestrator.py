@@ -56,6 +56,11 @@ class Orchestrator:
     def wait_for_ready(self, timeout=60):
         """Wait until GPS has fix."""
         log.info("[+] Waiting for GPS fix...")
+
+        # Flush Buffer
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+
         deadline = time.time() + timeout
         while time.time() < deadline:
             msg = self.conn.recv_match(
@@ -69,6 +74,11 @@ class Orchestrator:
 
     def arm(self):
         log.info("Arming...")
+
+        # Flush Buffer
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+        
         self.conn.mav.command_long_send(
             self.conn.target_system,
             self.conn.target_component,
@@ -400,8 +410,9 @@ class Orchestrator:
             self.write_label(mission_id, start_time, end_time,
                              waypoints_reached=list(reached_wps),
                              mission_success=success)
-            self.update_manifest_status(mission_id, "completed")
-            log.info(f"=== {mission_id} complete ({end_time - start_time:.1f}s) ===")
+            status = "completed" if success else "failed"
+            self.update_manifest_status(mission_id, status)
+            log.info(f"=== {mission_id} {status} ({end_time - start_time:.1f}s) ===")
 
     def run(self):
         """Iterate manifest, skip completed, run pending missions."""
