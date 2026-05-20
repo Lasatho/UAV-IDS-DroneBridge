@@ -35,8 +35,8 @@ from typing import List, Tuple, Optional
 # ---------------------------------------------------------------------------
 
 # Home position (arbitrary, flat Gazebo world — only relative offsets matter)
-HOME_LAT = 47.397742
-HOME_LNG = 8.545594
+HOME_LAT = -35.363261
+HOME_LNG = 149.165230
 HOME_ALT = 0.0
 
 # Earth radius for offset calculations (meters)

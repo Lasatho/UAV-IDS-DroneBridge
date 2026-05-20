@@ -25,8 +25,8 @@
   "wind_direction_deg": 90,
   "n_waypoints": 17,
   "home": {
-    "lat": 47.397742,
-    "lng": 8.545594,
+    "lat": -35.363261,
+    "lng": 149.16523,
     "alt": 0.0
   }
 }
