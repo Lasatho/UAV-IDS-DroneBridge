@@ -186,11 +186,11 @@ class Orchestrator:
             log.warning(f"  Mission upload issue: {ack}")
  
     def wait_mission_complete(self, n_waypoints: int, timeout=900):
-        """Wait for AUTO mission to complete, tracking waypoint progress."""
         log.info(f"  Waiting for mission complete ({n_waypoints} items)...")
         deadline = time.time() + timeout
+        min_flight_time = time.time() + 30  # ignore disarm for first 30s
         reached = set()
-        last_seq = n_waypoints - 1  # 0-indexed, last item is RTL
+        last_seq = n_waypoints - 1
 
         while time.time() < deadline and self.keep_running:
             msg = self.conn.recv_match(
@@ -211,12 +211,11 @@ class Orchestrator:
                 text = msg.text.strip()
                 if "Mission Complete" in text or "Auto disarmed" in text:
                     log.info(f"  Mission complete: {text}")
-                    log.info(f"  Waypoints reached: {len(reached)}/{n_waypoints}")
                     return True, reached
 
             elif mtype == "HEARTBEAT":
                 armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                if not armed and len(reached) > 0:
+                if not armed and len(reached) > 0 and time.time() > min_flight_time:
                     log.info("  Vehicle disarmed — mission done.")
                     return True, reached
 
