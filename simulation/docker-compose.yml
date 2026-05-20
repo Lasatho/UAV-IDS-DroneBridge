@@ -88,7 +88,7 @@ services:
     container_name: uav_ids_orchestrator
     network_mode: host
     volumes:
-      - ./dataset:/data
+      - ${REPO_ROOT}/dataset:/data
     depends_on:
       - mavproxy
     restart: unless-stopped

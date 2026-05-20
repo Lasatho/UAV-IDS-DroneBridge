@@ -33,6 +33,7 @@ done
 
 # ─── Docker ───────────────────────────────────────────────────────────────────
 echo "[*] Starting simulation stack..."
+export REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$(dirname "$0")"
 docker compose build orchestrator
 docker compose up
