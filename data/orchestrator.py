@@ -4,9 +4,9 @@ orchestrator.py — Automated dataset generation.
 
 Coordinates tcpdump, telemetry_logger, and ArduPilot SITL to generate
 labeled dataset runs. Each run produces:
-  - data/pcap/<run_id>.pcap
-  - data/telemetry/run_<id>_<MSG_TYPE>.csv
-  - data/labels/run_<id>.json
+  - data/pcap/<mission_id>.pcap
+  - data/telemetry/<mission_id>_<MSG_TYPE>.csv
+  - data/phase_labels/<mission_id>.json
 
 Usage:
     python3 orchestrator.py --manifest ./dataset/missions_manifest.csv --output ./dataset
@@ -19,6 +19,7 @@ import signal
 import subprocess
 import time
 import csv
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -30,6 +31,30 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Push notifications via ntfy.sh (optional)
+# Set env var NTFY_TOPIC to enable. Install ntfy app on phone,
+# subscribe to the same topic.
+# ---------------------------------------------------------------------------
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
+
+
+def notify(message: str):
+    """Send push notification via ntfy.sh. Fails silently."""
+    if not NTFY_TOPIC:
+        return
+    try:
+        import urllib.request
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+                data=message.encode(),
+                method="POST"
+            ), timeout=5
+        )
+    except Exception:
+        pass
+
 
 class Orchestrator:
     def __init__(self, output_dir: Path, manifest_path: Path,
@@ -39,7 +64,8 @@ class Orchestrator:
         self.connection = connection
         self.conn = None
         self.keep_running = True
- 
+        self.consecutive_failures = 0
+
         # Directories created by generate_missions.py already,
         # but ensure pcap/telemetry/phase_labels exist
         (output_dir / "pcap").mkdir(parents=True, exist_ok=True)
@@ -53,14 +79,11 @@ class Orchestrator:
         log.info(f"Heartbeat from system {self.conn.target_system}:"
                  f"{self.conn.target_component}")
 
-    def wait_for_ready(self, timeout=60):
+    def wait_for_ready(self, timeout=120):
         """Wait until GPS has fix."""
         log.info("[+] Waiting for GPS fix...")
-
-        # Flush Buffer
         while self.conn.recv_match(blocking=False) is not None:
             pass
-
         deadline = time.time() + timeout
         while time.time() < deadline:
             msg = self.conn.recv_match(
@@ -69,16 +92,13 @@ class Orchestrator:
             if msg and msg.fix_type >= 3:
                 log.info("GPS fix acquired.")
                 return True
-        log.warning("[?] Timeout waiting for GPS fix — proceeding anyway.")
+        log.warning("[?] Timeout waiting for GPS fix.")
         return False
 
     def arm(self):
         log.info("Arming...")
-
-        # Flash buffer
         while self.conn.recv_match(blocking=False) is not None:
             pass
-
         self.conn.mav.command_long_send(
             self.conn.target_system,
             self.conn.target_component,
@@ -98,11 +118,8 @@ class Orchestrator:
 
     def set_params(self, params: dict):
         """Send PARAM_SET for each drone parameter."""
-        
-        # Flush receive buffer
         while self.conn.recv_match(blocking=False) is not None:
             pass
-
         for param_id, value in params.items():
             log.info(f"  PARAM_SET {param_id} = {value}")
             self.conn.mav.param_set_send(
@@ -112,7 +129,6 @@ class Orchestrator:
                 float(value),
                 mavutil.mavlink.MAV_PARAM_TYPE_REAL32
             )
-            # Wait for PARAM_VALUE acknowledgment
             ack = self.conn.recv_match(
                 type="PARAM_VALUE", blocking=True, timeout=5.0
             )
@@ -120,7 +136,7 @@ class Orchestrator:
                 log.info(f"  {param_id} confirmed = {ack.param_value}")
             else:
                 log.warning(f"  No confirmation for {param_id}")
- 
+
     def upload_mission(self, waypoint_file: Path):
         """Parse QGC WPL 110 file and upload mission items via pymavlink."""
         items = []
@@ -133,18 +149,16 @@ class Orchestrator:
                 if len(parts) < 12:
                     continue
                 items.append(parts)
- 
+
         n = len(items)
         log.info(f"  Uploading {n} mission items from {waypoint_file.name}")
- 
-        # Send mission count
+
         self.conn.mav.mission_count_send(
             self.conn.target_system,
             self.conn.target_component,
             n
         )
- 
-        # Respond to MISSION_REQUEST / MISSION_REQUEST_INT
+
         uploaded = set()
         deadline = time.time() + 30
         while len(uploaded) < n and time.time() < deadline:
@@ -175,8 +189,7 @@ class Orchestrator:
                 float(p[10])            # z (alt)
             )
             uploaded.add(seq)
- 
-        # Wait for MISSION_ACK
+
         ack = self.conn.recv_match(
             type="MISSION_ACK", blocking=True, timeout=10.0
         )
@@ -184,20 +197,51 @@ class Orchestrator:
             log.info(f"  Mission upload accepted ({n} items)")
         else:
             log.warning(f"  Mission upload issue: {ack}")
- 
+
+    def estimate_mission_timeout(self, wp_path: Path, meta: dict) -> int:
+        """Estimate max mission duration from waypoint count and speed."""
+        with open(wp_path, "r") as f:
+            n_lines = sum(1 for _ in f) - 1  # minus header
+
+        speed_cms = meta["drone_params"].get("WPNAV_SPEED", 500)
+        speed_ms = speed_cms / 100.0
+
+        # Rough estimate: assume average 200m between waypoints
+        # + 60s for takeoff/RTL/landing overhead
+        # + 2x safety factor
+        estimated_s = (n_lines * 200.0 / max(speed_ms, 1.0)) + 60
+        timeout = max(300, int(estimated_s * 2))
+        log.info(f"  Mission timeout: {timeout}s (estimated {estimated_s:.0f}s, "
+                 f"{n_lines} WPs, {speed_ms:.1f} m/s)")
+        return timeout
+
     def wait_mission_complete(self, n_waypoints: int, timeout=900):
-        log.info(f"  Waiting for mission complete ({n_waypoints} items)...")
+        log.info(f"  Waiting for mission complete ({n_waypoints} items, "
+                 f"timeout={timeout}s)...")
         deadline = time.time() + timeout
-        min_flight_time = time.time() + 120  # ignore disarm for first 120s
+        min_flight_time = time.time() + 120
         reached = set()
         last_seq = n_waypoints - 1
+        last_armed_check = 0
 
         while time.time() < deadline and self.keep_running:
             msg = self.conn.recv_match(
-                type=["STATUSTEXT", "MISSION_ITEM_REACHED", "HEARTBEAT"],
+                type=["STATUSTEXT", "MISSION_ITEM_REACHED", "MISSION_CURRENT"],
                 blocking=True, timeout=2.0
             )
+
             if msg is None:
+                # No mission message — check armed status periodically
+                if time.time() > min_flight_time and time.time() - last_armed_check > 5:
+                    last_armed_check = time.time()
+                    hb = self.conn.recv_match(
+                        type="HEARTBEAT", blocking=True, timeout=2.0
+                    )
+                    if hb and hb.type == mavutil.mavlink.MAV_TYPE_QUADROTOR:
+                        armed = hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                        if not armed and len(reached) > 0:
+                            log.info("  Vehicle disarmed — mission done.")
+                            return True, reached
                 continue
 
             mtype = msg.get_type()
@@ -207,39 +251,24 @@ class Orchestrator:
                 log.info(f"  WP {msg.seq}/{last_seq} reached "
                          f"({len(reached)}/{n_waypoints})")
 
-            elif mtype == "STATUSTEXT":
-                text = msg.text.strip()
-                if "Mission Complete" in text or "Auto disarmed" in text:
-                    log.info(f"  Mission complete: {text}")
-                    return True, reached
+            elif mtype == "MISSION_CURRENT":
+                log.info(f"  Mission current: seq={msg.seq}")
 
-            elif mtype == "HEARTBEAT":
-                # Ignore heartbeats from GCS/MAVProxy (system 0 or type != 2)
-                if msg.type != mavutil.mavlink.MAV_TYPE_QUADROTOR:
-                    continue
-                armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                mode = msg.custom_mode
-                if not armed:
-                    log.info(f"  Heartbeat: DISARMED, mode={mode}, reached={len(reached)}")
-                    if len(reached) > 0 and time.time() > min_flight_time:
-                        log.info("  Vehicle disarmed — mission done.")
-                        return True, reached
-                    
             elif mtype == "STATUSTEXT":
                 text = msg.text.strip()
                 log.info(f"  STATUSTEXT: {text}")
                 if "Mission Complete" in text or "Auto disarmed" in text:
-                    log.info(f"  Mission complete: {text}")
+                    log.info(f"  Mission complete!")
                     return True, reached
 
         log.warning(f"  Timeout. Waypoints reached: {len(reached)}/{n_waypoints}")
         return False, reached
- 
+
     def configure_wind(self, wind_params: dict, wind_direction_deg: int):
         """Placeholder: configure Gazebo wind plugin for this mission."""
         # TODO: Implement via gz service call or SDF patching
         log.info(f"  Wind: {wind_params}, direction={wind_direction_deg}°")
- 
+
     def update_manifest_status(self, mission_id: str, new_status: str):
         """Update status column for mission_id in manifest CSV."""
         rows = []
@@ -255,7 +284,7 @@ class Orchestrator:
             writer.writeheader()
             for row in rows:
                 writer.writerow(row)
- 
+
     def set_mode(self, mode: str):
         mode_id = self.conn.mode_mapping()[mode]
         self.conn.mav.set_mode_send(
@@ -273,7 +302,7 @@ class Orchestrator:
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
             0, 0, 0, 0, 0, 0, 0, alt
         )
-        self._wait_altitude(alt, tolerance=1.0, timeout=30)
+        self._wait_altitude(alt, tolerance=1.0, timeout=60)
 
     def land(self):
         log.info("[+] Landing...")
@@ -283,7 +312,7 @@ class Orchestrator:
             mavutil.mavlink.MAV_CMD_NAV_LAND,
             0, 0, 0, 0, 0, 0, 0, 0
         )
-        self._wait_disarmed(timeout=30)
+        self._wait_disarmed(timeout=60)
 
     def hover(self, duration: float):
         log.info(f"[+] Hovering for {duration}s...")
@@ -304,7 +333,7 @@ class Orchestrator:
         log.warning(f"[+] Timeout waiting for ACK for command {command}")
         return False
 
-    def _wait_altitude(self, target_alt: float, tolerance=1.0, timeout=30):
+    def _wait_altitude(self, target_alt: float, tolerance=1.0, timeout=60):
         deadline = time.time() + timeout
         while time.time() < deadline:
             msg = self.conn.recv_match(
@@ -315,16 +344,19 @@ class Orchestrator:
             current_alt = msg.relative_alt / 1000.0
             if abs(current_alt - target_alt) < tolerance:
                 log.info(f"[+] Target altitude {target_alt}m reached.")
-                return
+                return True
         log.warning(f"[?] Timeout waiting for altitude {target_alt}m")
+        return False
 
-    def _wait_disarmed(self, timeout=30):
+    def _wait_disarmed(self, timeout=60):
         deadline = time.time() + timeout
         while time.time() < deadline:
             msg = self.conn.recv_match(
                 type="HEARTBEAT", blocking=True, timeout=2.0
             )
             if msg is None:
+                continue
+            if msg.type != mavutil.mavlink.MAV_TYPE_QUADROTOR:
                 continue
             armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
             if not armed:
@@ -384,14 +416,12 @@ class Orchestrator:
                 type="EKF_STATUS_REPORT", blocking=True, timeout=2.0
             )
             if msg:
-                # Flags: velocity, pos_horiz, pos_vert, compass, terrain
-                # All good when flags has bits 0-3 set
                 if msg.flags & 0x0F == 0x0F:
                     log.info("EKF converged.")
                     return True
         log.warning("[?] EKF not converged — trying anyway.")
         return False
-    
+
     def reboot_sitl(self):
         """Send preflight reboot to reset SITL state."""
         log.info("[+] Rebooting SITL...")
@@ -399,10 +429,9 @@ class Orchestrator:
             self.conn.target_system,
             self.conn.target_component,
             mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
-            0, 1, 0, 0, 0, 0, 0, 0  # param1=1 -> reboot autopilot
+            0, 1, 0, 0, 0, 0, 0, 0
         )
-        time.sleep(20)  # wait for SITL to reinitialize
-        # Reconnect
+        time.sleep(20)
         self.conn = mavutil.mavlink_connection(self.connection)
         self.conn.wait_heartbeat()
         log.info("[+] SITL rebooted, heartbeat OK.")
@@ -417,7 +446,7 @@ class Orchestrator:
                 return True
         log.warning("  Vehicle NOT armed.")
         return False
-    
+
     def verify_flying(self, timeout=30):
         """Check if vehicle has left the ground."""
         log.info("  Verifying takeoff...")
@@ -426,12 +455,12 @@ class Orchestrator:
             msg = self.conn.recv_match(
                 type="GLOBAL_POSITION_INT", blocking=True, timeout=2.0
             )
-            if msg and msg.relative_alt > 1000:  # >1m in mm
+            if msg and msg.relative_alt > 1000:
                 log.info(f"  Airborne (alt={msg.relative_alt/1000:.1f}m)")
                 return True
         log.warning("  Vehicle not airborne.")
         return False
-    
+
     def run_single(self, mission: dict):
         mission_id = mission["mission_id"]
         log.info(f"=== Starting {mission_id} ({mission['profile']}) ===")
@@ -441,15 +470,15 @@ class Orchestrator:
         meta_path = self.output_dir / "meta" / f"{mission_id}_params.json"
         with open(meta_path, "r") as f:
             meta = json.load(f)
- 
+
         # Configure wind
         self.configure_wind(meta["wind_params"], meta["wind_direction_deg"])
- 
+
         # Start capture
         tcpdump_proc = self.start_tcpdump(mission_id)
         telemetry_proc = self.start_telemetry_logger(mission_id)
         time.sleep(1)
- 
+
         start_time = time.time()
         success = False
         reached_wps = set()
@@ -457,11 +486,11 @@ class Orchestrator:
             if not self.wait_for_ready():
                 raise RuntimeError("No GPS fix")
             self.wait_ekf_ready(timeout=30)
-            
+
             # Set params and upload AFTER SITL is ready
             self.set_params(meta["drone_params"])
             self.upload_mission(wp_path)
-            
+
             self.set_mode("GUIDED")
             if not self.arm():
                 raise RuntimeError("Arming failed")
@@ -473,8 +502,12 @@ class Orchestrator:
                 raise RuntimeError("Takeoff failed")
             # Now switch to AUTO — mission continues from WP2
             self.set_mode("AUTO")
+
+            mission_timeout = self.estimate_mission_timeout(wp_path, meta)
             n_wps = len(open(wp_path).readlines()) - 1
-            success, reached_wps = self.wait_mission_complete(n_wps, timeout=900)
+            success, reached_wps = self.wait_mission_complete(
+                n_wps, timeout=mission_timeout
+            )
 
             if not success:
                 log.warning(f"  Mission {mission_id} did not complete cleanly")
@@ -492,29 +525,64 @@ class Orchestrator:
             status = "completed" if success else "failed"
             self.update_manifest_status(mission_id, status)
             log.info(f"=== {mission_id} {status} ({end_time - start_time:.1f}s) ===")
-            self.reboot_sitl()  # reboot sitl for next mission
+
+            # Track consecutive failures
+            if success:
+                self.consecutive_failures = 0
+            else:
+                self.consecutive_failures += 1
+                notify(f"[UAV-IDS] {mission_id} FAILED: "
+                       f"{self.consecutive_failures} consecutive failures")
+                if self.consecutive_failures >= 5:
+                    notify("[UAV-IDS] 5 consecutive failures — stopping orchestrator.")
+                    log.error("5 consecutive failures — stopping.")
+                    self.keep_running = False
+
+            self.reboot_sitl()
 
     def run(self):
-        """Iterate manifest, skip completed, run pending missions."""
+        """Iterate manifest, skip completed/failed, run pending missions."""
         self.connect()
- 
+
         with open(self.manifest_path, "r", newline="") as f:
             reader = csv.DictReader(f)
             missions = [row for row in reader]
- 
+
         pending = [m for m in missions if m["status"] == "pending"]
         total = len(missions)
         done = total - len(pending)
-        log.info(f"Manifest: {total} missions, {done} completed, {len(pending)} pending")
- 
+        log.info(f"Manifest: {total} missions, {done} completed, "
+                 f"{len(pending)} pending")
+
+        notify(f"[UAV-IDS] Orchestrator started: {len(pending)} pending missions")
+
+        completed_count = 0
+        failed_count = 0
         for i, mission in enumerate(pending):
             if not self.keep_running:
                 log.info("Interrupted — exiting.")
+                notify(f"[UAV-IDS] Interrupted after {completed_count} completed, "
+                       f"{failed_count} failed")
                 break
             log.info(f"[{done + i + 1}/{total}] Next: {mission['mission_id']}")
             self.run_single(mission)
-            time.sleep(2)  # brief pause between missions
- 
+
+            # Track counts
+            if self.consecutive_failures == 0:
+                completed_count += 1
+            else:
+                failed_count += 1
+
+            # Progress notification every 100 missions
+            processed = completed_count + failed_count
+            if processed % 100 == 0:
+                notify(f"[UAV-IDS] Progress: {processed}/{len(pending)} processed "
+                       f"({completed_count} ok, {failed_count} failed)")
+
+            time.sleep(2)
+
+        notify(f"[UAV-IDS] Orchestrator finished: {completed_count} completed, "
+               f"{failed_count} failed")
         log.info("All pending missions processed.")
 
 
@@ -535,13 +603,13 @@ def main():
         help="MAVLink connection string (default: udpin:127.0.0.1:14552)"
     )
     args = parser.parse_args()
- 
+
     orchestrator = Orchestrator(
         output_dir=args.output,
         manifest_path=args.manifest,
         connection=args.connection
     )
- 
+
     signal.signal(
         signal.SIGTERM,
         lambda *_: setattr(orchestrator, "keep_running", False)
@@ -550,8 +618,9 @@ def main():
         signal.SIGINT,
         lambda *_: setattr(orchestrator, "keep_running", False)
     )
- 
+
     orchestrator.run()
+
 
 if __name__ == "__main__":
     main()

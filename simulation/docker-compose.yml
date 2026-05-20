@@ -86,6 +86,8 @@ services:
     build:
       context: ..
       dockerfile: simulation/orchestrator/Dockerfile
+    environment:
+      - NTFY_TOPIC=uav-ids-lasse
     container_name: uav_ids_orchestrator
     network_mode: host
     volumes:
