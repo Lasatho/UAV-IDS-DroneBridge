@@ -188,7 +188,7 @@ class Orchestrator:
     def wait_mission_complete(self, n_waypoints: int, timeout=900):
         log.info(f"  Waiting for mission complete ({n_waypoints} items)...")
         deadline = time.time() + timeout
-        min_flight_time = time.time() + 30  # ignore disarm for first 30s
+        min_flight_time = time.time() + 120  # ignore disarm for first 120s
         reached = set()
         last_seq = n_waypoints - 1
 
