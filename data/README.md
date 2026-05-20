@@ -23,9 +23,13 @@ python3 data/generate_missions.py --output-dir ./dataset
 # 3. Run orchestrator (resumable — Ctrl+C to stop, restart to continue)
 python3 data/orchestrator.py --manifest ./dataset/missions_manifest.csv --output ./dataset
 
+# watch simulation progress with
+docker logs -f orchestrator
+
 # 4. Validate completed missions
 python3 data/validate_missions.py --dataset ./dataset
 ```
+
 
 ## Output Structure
 

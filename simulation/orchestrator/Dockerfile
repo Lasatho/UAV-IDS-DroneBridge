@@ -11,8 +11,10 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt /opt/orchestrator/requirements.txt
 RUN pip3 install -r /opt/orchestrator/requirements.txt
 
-COPY dataset/ /opt/orchestrator/
+COPY data/ /opt/orchestrator/
 
 WORKDIR /opt/orchestrator
 
-CMD ["python3", "orchestrator.py", "--output", "/data"]
+CMD ["python3", "orchestrator.py", \
+     "--manifest", "/data/missions_manifest.csv", \
+     "--output", "/data"]
