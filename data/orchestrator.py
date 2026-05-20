@@ -214,6 +214,9 @@ class Orchestrator:
                     return True, reached
 
             elif mtype == "HEARTBEAT":
+                # Ignore heartbeats from GCS/MAVProxy (system 0 or type != 2)
+                if msg.type != mavutil.mavlink.MAV_TYPE_QUADROTOR:
+                    continue
                 armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
                 mode = msg.custom_mode
                 if not armed:
