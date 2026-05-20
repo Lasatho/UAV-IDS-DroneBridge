@@ -78,7 +78,7 @@ class Orchestrator:
         # Flash buffer
         while self.conn.recv_match(blocking=False) is not None:
             pass
-        
+
         self.conn.mav.command_long_send(
             self.conn.target_system,
             self.conn.target_component,
@@ -395,6 +395,31 @@ class Orchestrator:
         self.conn.wait_heartbeat()
         log.info("[+] SITL rebooted, heartbeat OK.")
 
+    def verify_armed(self, timeout=10):
+        """Check heartbeat to verify armed state."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.conn.recv_match(type="HEARTBEAT", blocking=True, timeout=2.0)
+            if msg and msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
+                log.info("  Armed confirmed via heartbeat.")
+                return True
+        log.warning("  Vehicle NOT armed.")
+        return False
+    
+    def verify_flying(self, timeout=30):
+        """Check if vehicle has left the ground."""
+        log.info("  Verifying takeoff...")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.conn.recv_match(
+                type="GLOBAL_POSITION_INT", blocking=True, timeout=2.0
+            )
+            if msg and msg.relative_alt > 1000:  # >1m in mm
+                log.info(f"  Airborne (alt={msg.relative_alt/1000:.1f}m)")
+                return True
+        log.warning("  Vehicle not airborne.")
+        return False
+    
     def run_single(self, mission: dict):
         mission_id = mission["mission_id"]
         log.info(f"=== Starting {mission_id} ({mission['profile']}) ===")
@@ -428,9 +453,14 @@ class Orchestrator:
             self.set_mode("GUIDED")
             if not self.arm():
                 raise RuntimeError("Arming failed")
+            if not self.verify_armed():
+                raise RuntimeError("Vehicle not armed")
             self.set_mode("AUTO")
+            if not self.verify_flying():
+                raise RuntimeError("Takeoff failed")
             n_wps = len(open(wp_path).readlines()) - 1
             success, reached_wps = self.wait_mission_complete(n_wps, timeout=900)
+            
             if not success:
                 log.warning(f"  Mission {mission_id} did not complete cleanly")
         except Exception as e:
