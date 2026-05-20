@@ -215,8 +215,18 @@ class Orchestrator:
 
             elif mtype == "HEARTBEAT":
                 armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                if not armed and len(reached) > 0 and time.time() > min_flight_time:
-                    log.info("  Vehicle disarmed — mission done.")
+                mode = msg.custom_mode
+                if not armed:
+                    log.info(f"  Heartbeat: DISARMED, mode={mode}, reached={len(reached)}")
+                    if len(reached) > 0 and time.time() > min_flight_time:
+                        log.info("  Vehicle disarmed — mission done.")
+                        return True, reached
+                    
+            elif mtype == "STATUSTEXT":
+                text = msg.text.strip()
+                log.info(f"  STATUSTEXT: {text}")
+                if "Mission Complete" in text or "Auto disarmed" in text:
+                    log.info(f"  Mission complete: {text}")
                     return True, reached
 
         log.warning(f"  Timeout. Waypoints reached: {len(reached)}/{n_waypoints}")
