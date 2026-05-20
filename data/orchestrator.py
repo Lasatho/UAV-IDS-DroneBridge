@@ -75,15 +75,15 @@ class Orchestrator:
     def arm(self):
         log.info("Arming...")
 
-        # Flush Buffer
+        # Flash buffer
         while self.conn.recv_match(blocking=False) is not None:
             pass
-
+        
         self.conn.mav.command_long_send(
             self.conn.target_system,
             self.conn.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0, 1, 0, 0, 0, 0, 0, 0
+            0, 1, 21196, 0, 0, 0, 0, 0  # param2=21196 = force arm
         )
         return self._wait_for_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM)
 
