@@ -34,4 +34,5 @@ done
 # ─── Docker ───────────────────────────────────────────────────────────────────
 echo "[*] Starting simulation stack..."
 cd "$(dirname "$0")"
-docker compose up --build
+docker compose build orchestrator
+docker compose up
