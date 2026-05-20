@@ -13,12 +13,11 @@ build/
 venv/
 env/
 .env/
+.venv/
 
-# Dataset files (too large for git)
+# Large dataset files
 *.pcap
-*.csv
 *.tlog
-*.parm
 *.bin
 
 # Compiled binaries
@@ -42,6 +41,15 @@ cmake_install.cmake
 # OS
 .DS_Store
 Thumbs.db
-.venv/
+
+# data/ — track scripts and docs, ignore generated output
 data/**
 !data/*.py
+!data/README.md
+!data/.gitkeep
+
+# dataset/ — track waypoints and meta, ignore capture data
+dataset/pcap/
+dataset/telemetry/
+dataset/phase_labels/
+dataset/validation_report.csv
