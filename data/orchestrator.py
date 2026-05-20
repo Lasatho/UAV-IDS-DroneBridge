@@ -387,9 +387,9 @@ class Orchestrator:
             self.conn.target_system,
             self.conn.target_component,
             mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
-            0, 1, 0, 0, 0, 0, 0, 0  # param1=1 → reboot autopilot
+            0, 1, 0, 0, 0, 0, 0, 0  # param1=1 -> reboot autopilot
         )
-        time.sleep(10)  # wait for SITL to reinitialize
+        time.sleep(20)  # wait for SITL to reinitialize
         # Reconnect
         self.conn = mavutil.mavlink_connection(self.connection)
         self.conn.wait_heartbeat()
@@ -398,21 +398,15 @@ class Orchestrator:
     def run_single(self, mission: dict):
         mission_id = mission["mission_id"]
         log.info(f"=== Starting {mission_id} ({mission['profile']}) ===")
- 
+        wp_path = self.output_dir / "waypoints" / mission["waypoint_file"]
+
         # Load full params from meta JSON
         meta_path = self.output_dir / "meta" / f"{mission_id}_params.json"
         with open(meta_path, "r") as f:
             meta = json.load(f)
  
-        # Set drone parameters
-        self.set_params(meta["drone_params"])
- 
         # Configure wind
         self.configure_wind(meta["wind_params"], meta["wind_direction_deg"])
- 
-        # Upload mission waypoints
-        wp_path = self.output_dir / "waypoints" / mission["waypoint_file"]
-        self.upload_mission(wp_path)
  
         # Start capture
         tcpdump_proc = self.start_tcpdump(mission_id)
@@ -425,7 +419,12 @@ class Orchestrator:
         try:
             if not self.wait_for_ready():
                 raise RuntimeError("No GPS fix")
-            self.wait_ekf_ready(timeout=30) # wait till ekf convergence
+            self.wait_ekf_ready(timeout=30)
+            
+            # Set params and upload AFTER SITL is ready
+            self.set_params(meta["drone_params"])
+            self.upload_mission(wp_path)
+            
             self.set_mode("GUIDED")
             if not self.arm():
                 raise RuntimeError("Arming failed")
