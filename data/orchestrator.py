@@ -360,7 +360,26 @@ class Orchestrator:
         with open(label_path, "w") as f:
             json.dump(label, f, indent=2)
         log.info(f"[+] Label written -> {label_path}")
- 
+
+    def wait_ekf_ready(self, timeout=30):
+        """Wait until EKF has converged."""
+        log.info("[+] Waiting for EKF convergence...")
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.conn.recv_match(
+                type="EKF_STATUS_REPORT", blocking=True, timeout=2.0
+            )
+            if msg:
+                # Flags: velocity, pos_horiz, pos_vert, compass, terrain
+                # All good when flags has bits 0-3 set
+                if msg.flags & 0x0F == 0x0F:
+                    log.info("EKF converged.")
+                    return True
+        log.warning("[?] EKF not converged — trying anyway.")
+        return False
+    
     def run_single(self, mission: dict):
         mission_id = mission["mission_id"]
         log.info(f"=== Starting {mission_id} ({mission['profile']}) ===")
@@ -391,6 +410,7 @@ class Orchestrator:
         try:
             if not self.wait_for_ready():
                 raise RuntimeError("No GPS fix")
+            self.wait_ekf_ready(timeout=30) # wait till ekf convergence
             self.set_mode("GUIDED")
             if not self.arm():
                 raise RuntimeError("Arming failed")
