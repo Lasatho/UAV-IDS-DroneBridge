@@ -1,0 +1,31 @@
+{
+  "mission_id": "mission_02580",
+  "profile": "rectangle",
+  "geometry_params": [
+    800,
+    30,
+    2
+  ],
+  "drone_preset": "standard",
+  "drone_params": {
+    "WPNAV_SPEED": 500,
+    "WPNAV_SPEED_UP": 250,
+    "WPNAV_SPEED_DN": 150,
+    "WPNAV_LOIT_SPEED": 500,
+    "WPNAV_RADIUS": 200,
+    "RTL_ALT": 3000
+  },
+  "wind_profile": "calm",
+  "wind_params": {
+    "speed_min": 0.0,
+    "speed_max": 1.0,
+    "turbulence": "none"
+  },
+  "wind_direction_deg": 135,
+  "n_waypoints": 11,
+  "home": {
+    "lat": 47.397742,
+    "lng": 8.545594,
+    "alt": 0.0
+  }
+}

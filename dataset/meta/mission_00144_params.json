@@ -1,0 +1,31 @@
+{
+  "mission_id": "mission_00144",
+  "profile": "rectangle",
+  "geometry_params": [
+    100,
+    15,
+    3
+  ],
+  "drone_preset": "conservative",
+  "drone_params": {
+    "WPNAV_SPEED": 300,
+    "WPNAV_SPEED_UP": 150,
+    "WPNAV_SPEED_DN": 100,
+    "WPNAV_LOIT_SPEED": 250,
+    "WPNAV_RADIUS": 200,
+    "RTL_ALT": 3000
+  },
+  "wind_profile": "gusty",
+  "wind_params": {
+    "speed_min": 3.0,
+    "speed_max": 10.0,
+    "turbulence": "high"
+  },
+  "wind_direction_deg": 135,
+  "n_waypoints": 15,
+  "home": {
+    "lat": 47.397742,
+    "lng": 8.545594,
+    "alt": 0.0
+  }
+}

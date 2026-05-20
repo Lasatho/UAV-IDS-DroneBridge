@@ -1,0 +1,32 @@
+{
+  "mission_id": "mission_10444",
+  "profile": "loiter",
+  "geometry_params": [
+    50,
+    180,
+    15,
+    -1
+  ],
+  "drone_preset": "conservative",
+  "drone_params": {
+    "WPNAV_SPEED": 300,
+    "WPNAV_SPEED_UP": 150,
+    "WPNAV_SPEED_DN": 100,
+    "WPNAV_LOIT_SPEED": 250,
+    "WPNAV_RADIUS": 200,
+    "RTL_ALT": 3000
+  },
+  "wind_profile": "moderate",
+  "wind_params": {
+    "speed_min": 5.0,
+    "speed_max": 8.0,
+    "turbulence": "medium"
+  },
+  "wind_direction_deg": 135,
+  "n_waypoints": 9,
+  "home": {
+    "lat": 47.397742,
+    "lng": 8.545594,
+    "alt": 0.0
+  }
+}
