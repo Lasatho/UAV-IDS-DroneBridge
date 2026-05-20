@@ -78,7 +78,7 @@ class Orchestrator:
         # Flush Buffer
         while self.conn.recv_match(blocking=False) is not None:
             pass
-        
+
         self.conn.mav.command_long_send(
             self.conn.target_system,
             self.conn.target_component,
@@ -335,7 +335,7 @@ class Orchestrator:
         return subprocess.Popen(
             [
                 "python3", "telemetry_logger.py",
-                "--connection", self.connection,
+                "--connection", "udpin:127.0.0.1:14553",
                 "--output", str(telemetry_dir),
                 "--run-id", run_id
             ]
