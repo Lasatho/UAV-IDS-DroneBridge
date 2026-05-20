@@ -75,7 +75,7 @@ class Orchestrator:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 1, 0, 0, 0, 0, 0, 0
         )
-        self._wait_for_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM)
+        return self._wait_for_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM)
 
     def disarm(self):
         log.info("Disarming...")
@@ -341,7 +341,7 @@ class Orchestrator:
             "attack_end": None,
             "notes": ""
         }
-        label_path = self.output_dir / "labels" / f"{run_id}.json"
+        label_path = self.output_dir / "phase_labels" / f"{run_id}.json"
         with open(label_path, "w") as f:
             json.dump(label, f, indent=2)
         log.info(f"[+] Label written -> {label_path}")
@@ -371,15 +371,16 @@ class Orchestrator:
         time.sleep(1)
  
         start_time = time.time()
+        success = False
+        reached_wps = set()
         try:
-            self.wait_for_ready()
+            if not self.wait_for_ready():
+                raise RuntimeError("No GPS fix")
             self.set_mode("AUTO")
-            self.arm()
-            n_wps = len(open(wp_path).readlines()) - 1  # minus header line
+            if not self.arm():
+                raise RuntimeError("Arming failed")
+            n_wps = len(open(wp_path).readlines()) - 1
             success, reached_wps = self.wait_mission_complete(n_wps, timeout=900)
-            self.write_label(mission_id, start_time, end_time,
-                        waypoints_reached=list(reached_wps),
-                        mission_success=success)
             if not success:
                 log.warning(f"  Mission {mission_id} did not complete cleanly")
         except Exception as e:
@@ -390,7 +391,9 @@ class Orchestrator:
             tcpdump_proc.wait()
             telemetry_proc.terminate()
             telemetry_proc.wait()
-            self.write_label(mission_id, start_time, end_time)
+            self.write_label(mission_id, start_time, end_time,
+                             waypoints_reached=list(reached_wps),
+                             mission_success=success)
             self.update_manifest_status(mission_id, "completed")
             log.info(f"=== {mission_id} complete ({end_time - start_time:.1f}s) ===")
 
