@@ -455,12 +455,15 @@ class Orchestrator:
                 raise RuntimeError("Arming failed")
             if not self.verify_armed():
                 raise RuntimeError("Vehicle not armed")
-            self.set_mode("AUTO")
+            # Takeoff in GUIDED first to prevent auto-disarm
+            self.takeoff(15)
             if not self.verify_flying():
                 raise RuntimeError("Takeoff failed")
+            # Now switch to AUTO — mission continues from WP2
+            self.set_mode("AUTO")
             n_wps = len(open(wp_path).readlines()) - 1
             success, reached_wps = self.wait_mission_complete(n_wps, timeout=900)
-            
+
             if not success:
                 log.warning(f"  Mission {mission_id} did not complete cleanly")
         except Exception as e:
