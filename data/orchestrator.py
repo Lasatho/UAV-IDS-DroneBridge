@@ -215,18 +215,16 @@ class Orchestrator:
                  f"{n_lines} WPs, {speed_ms:.1f} m/s)")
         return timeout
 
-    def wait_mission_complete(self, n_waypoints: int, timeout=900):
-        log.info(f"  Waiting for mission complete ({n_waypoints} items, "
-                 f"timeout={timeout}s)...")
+    def wait_mission_complete(self, timeout=900):
+        log.info(f"  Waiting for mission complete (timeout={timeout}s)...")
         deadline = time.time() + timeout
         min_flight_time = time.time() + 120
         reached = set()
-        last_seq = n_waypoints - 1
         last_armed_check = 0
 
         while time.time() < deadline and self.keep_running:
             msg = self.conn.recv_match(
-                type=["STATUSTEXT", "MISSION_ITEM_REACHED", "MISSION_CURRENT"],
+                type=["STATUSTEXT", "MISSION_ITEM_REACHED"],
                 blocking=True, timeout=2.0
             )
 
@@ -240,7 +238,8 @@ class Orchestrator:
                     if hb and hb.type == mavutil.mavlink.MAV_TYPE_QUADROTOR:
                         armed = hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
                         if not armed and len(reached) > 0:
-                            log.info("  Vehicle disarmed — mission done.")
+                            log.info(f"  Vehicle disarmed — mission done. "
+                                     f"WPs reached: {len(reached)}")
                             return True, reached
                 continue
 
@@ -248,20 +247,18 @@ class Orchestrator:
 
             if mtype == "MISSION_ITEM_REACHED":
                 reached.add(msg.seq)
-                log.info(f"  WP {msg.seq}/{last_seq} reached "
-                         f"({len(reached)}/{n_waypoints})")
-
-            elif mtype == "MISSION_CURRENT":
-                log.info(f"  Mission current: seq={msg.seq}")
+                log.info(f"  WP {msg.seq} reached ({len(reached)} total)")
 
             elif mtype == "STATUSTEXT":
                 text = msg.text.strip()
                 log.info(f"  STATUSTEXT: {text}")
-                if "Mission Complete" in text or "Auto disarmed" in text:
-                    log.info(f"  Mission complete!")
+                if ("Mission Complete" in text or
+                    "Auto disarmed" in text or
+                    "Disarming motors" in text):
+                    log.info(f"  Mission complete! WPs reached: {len(reached)}")
                     return True, reached
 
-        log.warning(f"  Timeout. Waypoints reached: {len(reached)}/{n_waypoints}")
+        log.warning(f"  Timeout. Waypoints reached: {len(reached)}")
         return False, reached
 
     def configure_wind(self, wind_params: dict, wind_direction_deg: int):
@@ -504,9 +501,8 @@ class Orchestrator:
             self.set_mode("AUTO")
 
             mission_timeout = self.estimate_mission_timeout(wp_path, meta)
-            n_wps = len(open(wp_path).readlines()) - 1
             success, reached_wps = self.wait_mission_complete(
-                n_wps, timeout=mission_timeout
+                timeout=mission_timeout
             )
 
             if not success:
