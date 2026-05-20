@@ -88,6 +88,11 @@ class Orchestrator:
 
     def set_params(self, params: dict):
         """Send PARAM_SET for each drone parameter."""
+        
+        # Flush receive buffer
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+
         for param_id, value in params.items():
             log.info(f"  PARAM_SET {param_id} = {value}")
             self.conn.mav.param_set_send(
@@ -376,9 +381,10 @@ class Orchestrator:
         try:
             if not self.wait_for_ready():
                 raise RuntimeError("No GPS fix")
-            self.set_mode("AUTO")
+            self.set_mode("GUIDED")
             if not self.arm():
                 raise RuntimeError("Arming failed")
+            self.set_mode("AUTO")
             n_wps = len(open(wp_path).readlines()) - 1
             success, reached_wps = self.wait_mission_complete(n_wps, timeout=900)
             if not success:

@@ -20,10 +20,11 @@ echo "[*] Configuring interfaces..."
 for iface in wlan0 wlan1 wlan2; do
     sudo ip link set $iface down
     sudo iw dev $iface set type monitor
+    sudo ip link set $iface mtu 2304
     sudo ip link set $iface up
     sudo iw dev $iface set channel 6 || true
 done
-sudo ip link set hwsim0 up
+sudo ip link set hwsim0 up  
 
 echo "[*] Verifying interfaces..."
 for iface in wlan0 wlan1 wlan2; do
