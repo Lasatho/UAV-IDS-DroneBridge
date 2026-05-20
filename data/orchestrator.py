@@ -380,6 +380,21 @@ class Orchestrator:
         log.warning("[?] EKF not converged — trying anyway.")
         return False
     
+    def reboot_sitl(self):
+        """Send preflight reboot to reset SITL state."""
+        log.info("[+] Rebooting SITL...")
+        self.conn.mav.command_long_send(
+            self.conn.target_system,
+            self.conn.target_component,
+            mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+            0, 1, 0, 0, 0, 0, 0, 0  # param1=1 → reboot autopilot
+        )
+        time.sleep(10)  # wait for SITL to reinitialize
+        # Reconnect
+        self.conn = mavutil.mavlink_connection(self.connection)
+        self.conn.wait_heartbeat()
+        log.info("[+] SITL rebooted, heartbeat OK.")
+
     def run_single(self, mission: dict):
         mission_id = mission["mission_id"]
         log.info(f"=== Starting {mission_id} ({mission['profile']}) ===")
@@ -433,6 +448,7 @@ class Orchestrator:
             status = "completed" if success else "failed"
             self.update_manifest_status(mission_id, status)
             log.info(f"=== {mission_id} {status} ({end_time - start_time:.1f}s) ===")
+            self.reboot_sitl()  # reboot sitl for next mission
 
     def run(self):
         """Iterate manifest, skip completed, run pending missions."""
