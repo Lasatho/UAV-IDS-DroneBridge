@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-visualize_mission.py — Plot all captured sensor data for a single mission.
+visualize_mission.py — Plot all captured sensor + network data for a single mission.
 
 Generates a multi-panel figure showing:
-  1. 3D trajectory (Ist) vs planned waypoints (Soll)
-  2. 2D ground track (lat/lon) with waypoints
-  3. Altitude profile over time
-  4. IMU accelerations (x, y, z)
-  5. IMU gyroscope (x, y, z)
-  6. Servo/motor outputs (channels 1-4)
-  7. GPS quality (fix_type, satellites, eph)
-  8. Barometric pressure
+  Physical layer:
+    1. 3D trajectory (Ist) vs planned waypoints (Soll)
+    2. 2D ground track (lat/lon) with waypoints
+    3. Altitude profile over time
+    4. IMU accelerations (x, y, z)
+    5. IMU gyroscope (x, y, z)
+    6. Servo/motor outputs (channels 1-4)
+    7. GPS quality (fix_type, satellites, eph)
+    8. Barometric pressure
+  Network layer:
+    9.  Frame timeline (size over time, colored by direction)
+    10. Payload size distribution (histogram)
+    11. Sequence number progression per direction
+    12. Traffic direction balance over time
 
 Usage:
     python3 visualize_mission.py --dataset ./dataset --mission mission_00028
@@ -120,6 +126,15 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
     gps = load_csv(gps_file)
     press = load_csv(press_file)
 
+    # Load network data (optional — skip network panels if missing)
+    network_dir = dataset_dir / "network"
+    net_file = network_dir / f"{mission_id}_network.csv"
+    net = None
+    if net_file.exists():
+        net = load_csv(net_file)
+    else:
+        print(f"Note: No network data at {net_file} — skipping network panels")
+
     # Load waypoints
     wp_file = wp_dir / f"{mission_id}.waypoints"
     waypoints = load_waypoints(wp_file)
@@ -173,18 +188,21 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
                 f"Duration: {duration:.0f}s | {status_str}")
 
     # --------------- FIGURE ---------------
-    fig = plt.figure(figsize=(20, 24))
-    fig.suptitle(f"{mission_id}", fontsize=18, fontweight="bold", y=0.98)
-    fig.text(0.5, 0.965, subtitle, ha="center", fontsize=11, color="gray")
+    n_rows = 6 if net is not None else 4
+    fig = plt.figure(figsize=(20, n_rows * 6))
+    fig.suptitle(f"{mission_id}", fontsize=18, fontweight="bold", y=0.99)
+    fig.text(0.5, 0.98, subtitle, ha="center", fontsize=11, color="gray")
 
     # Color scheme
     c_traj = "#2196F3"
     c_wp = "#F44336"
     c_start = "#4CAF50"
     c_end = "#FF9800"
+    c_to_drone = "#E91E63"
+    c_to_gcs = "#00BCD4"
 
     # --- 1. 3D Trajectory ---
-    ax1 = fig.add_subplot(4, 2, 1, projection="3d")
+    ax1 = fig.add_subplot(n_rows, 2, 1, projection="3d")
     ax1.plot(east, north, alt_rel, color=c_traj, linewidth=0.8, alpha=0.8)
     ax1.scatter(wp_east, wp_north, wp_alt, c=c_wp, s=80, marker="^",
                 label="Waypoints", zorder=5, edgecolors="white", linewidths=0.5)
@@ -200,7 +218,7 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
     ax1.legend(fontsize=8)
 
     # --- 2. 2D Ground Track ---
-    ax2 = fig.add_subplot(4, 2, 2)
+    ax2 = fig.add_subplot(n_rows, 2, 2)
     ax2.plot(east, north, color=c_traj, linewidth=0.8, alpha=0.8)
     ax2.scatter(wp_east, wp_north, c=c_wp, s=80, marker="^",
                 label="Waypoints", zorder=5, edgecolors="white", linewidths=0.5)
@@ -220,7 +238,7 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
     ax2.grid(True, alpha=0.3)
 
     # --- 3. Altitude Profile ---
-    ax3 = fig.add_subplot(4, 2, 3)
+    ax3 = fig.add_subplot(n_rows, 2, 3)
     ax3.plot(t_gpi, alt_rel, color=c_traj, linewidth=0.8)
     ax3.axhline(y=0, color="brown", linestyle="--", alpha=0.5, label="Ground")
     for walt in set(wp_alt):
@@ -231,7 +249,7 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
     ax3.grid(True, alpha=0.3)
 
     # --- 4. IMU Accelerations ---
-    ax4 = fig.add_subplot(4, 2, 4)
+    ax4 = fig.add_subplot(n_rows, 2, 4)
     ax4.plot(t_imu, imu["xacc"], label="X", linewidth=0.5, alpha=0.8)
     ax4.plot(t_imu, imu["yacc"], label="Y", linewidth=0.5, alpha=0.8)
     ax4.plot(t_imu, imu["zacc"], label="Z", linewidth=0.5, alpha=0.8)
@@ -242,7 +260,7 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
     ax4.grid(True, alpha=0.3)
 
     # --- 5. IMU Gyroscope ---
-    ax5 = fig.add_subplot(4, 2, 5)
+    ax5 = fig.add_subplot(n_rows, 2, 5)
     ax5.plot(t_imu, imu["xgyro"], label="X", linewidth=0.5, alpha=0.8)
     ax5.plot(t_imu, imu["ygyro"], label="Y", linewidth=0.5, alpha=0.8)
     ax5.plot(t_imu, imu["zgyro"], label="Z", linewidth=0.5, alpha=0.8)
@@ -253,7 +271,7 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
     ax5.grid(True, alpha=0.3)
 
     # --- 6. Servo/Motor Outputs ---
-    ax6 = fig.add_subplot(4, 2, 6)
+    ax6 = fig.add_subplot(n_rows, 2, 6)
     ax6.plot(t_servo, servo["servo1_raw"], label="M1", linewidth=0.5, alpha=0.8)
     ax6.plot(t_servo, servo["servo2_raw"], label="M2", linewidth=0.5, alpha=0.8)
     ax6.plot(t_servo, servo["servo3_raw"], label="M3", linewidth=0.5, alpha=0.8)
@@ -265,7 +283,7 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
     ax6.grid(True, alpha=0.3)
 
     # --- 7. GPS Quality ---
-    ax7 = fig.add_subplot(4, 2, 7)
+    ax7 = fig.add_subplot(n_rows, 2, 7)
     ax7_twin = ax7.twinx()
     ax7.plot(t_gps, gps["satellites_visible"], color="#4CAF50",
              linewidth=0.8, label="Satellites")
@@ -281,14 +299,74 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
     ax7.grid(True, alpha=0.3)
 
     # --- 8. Barometric Pressure ---
-    ax8 = fig.add_subplot(4, 2, 8)
+    ax8 = fig.add_subplot(n_rows, 2, 8)
     ax8.plot(t_press, press["press_abs"], color="#9C27B0", linewidth=0.8)
     ax8.set_xlabel("Time (s)")
     ax8.set_ylabel("Pressure (hPa)")
     ax8.set_title("Barometric Pressure")
     ax8.grid(True, alpha=0.3)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    # --------------- NETWORK PANELS ---------------
+    if net is not None:
+        # Network time axis (relative seconds from first frame)
+        t0_net = net["timestamp_s"][0]
+        t_net = net["timestamp_s"] - t0_net
+
+        dir_mask_drone = net["direction"] == 1   # to drone
+        dir_mask_gcs = net["direction"] == 3     # to GCS
+
+        # --- 9. Frame Timeline (size over time, colored by direction) ---
+        ax9 = fig.add_subplot(n_rows, 2, 9)
+        ax9.scatter(t_net[dir_mask_drone], net["frame_len"][dir_mask_drone],
+                    s=8, alpha=0.6, c=c_to_drone, label="GCS → Drone", zorder=3)
+        ax9.scatter(t_net[dir_mask_gcs], net["frame_len"][dir_mask_gcs],
+                    s=8, alpha=0.6, c=c_to_gcs, label="Drone → GCS", zorder=3)
+        ax9.set_xlabel("Time (s)")
+        ax9.set_ylabel("Frame Length (bytes)")
+        ax9.set_title("DroneBridge Frame Timeline")
+        ax9.legend(fontsize=8)
+        ax9.grid(True, alpha=0.3)
+
+        # --- 10. Payload Size Distribution ---
+        ax10 = fig.add_subplot(n_rows, 2, 10)
+        bins = np.linspace(0, max(net["payload_len"].max(), 1), 40)
+        ax10.hist(net["payload_len"][dir_mask_drone], bins=bins, alpha=0.7,
+                  color=c_to_drone, label="GCS → Drone")
+        ax10.hist(net["payload_len"][dir_mask_gcs], bins=bins, alpha=0.7,
+                  color=c_to_gcs, label="Drone → GCS")
+        ax10.set_xlabel("Payload Length (bytes)")
+        ax10.set_ylabel("Count")
+        ax10.set_title("Payload Size Distribution")
+        ax10.legend(fontsize=8)
+        ax10.grid(True, alpha=0.3)
+
+        # --- 11. Sequence Number Progression ---
+        ax11 = fig.add_subplot(n_rows, 2, 11)
+        ax11.scatter(t_net[dir_mask_drone], net["seq_num"][dir_mask_drone],
+                     s=5, alpha=0.6, c=c_to_drone, label="GCS → Drone")
+        ax11.scatter(t_net[dir_mask_gcs], net["seq_num"][dir_mask_gcs],
+                     s=5, alpha=0.6, c=c_to_gcs, label="Drone → GCS")
+        ax11.set_xlabel("Time (s)")
+        ax11.set_ylabel("Sequence Number")
+        ax11.set_title("Sequence Number Progression")
+        ax11.legend(fontsize=8)
+        ax11.grid(True, alpha=0.3)
+
+        # --- 12. Cumulative Bytes per Direction ---
+        ax12 = fig.add_subplot(n_rows, 2, 12)
+        cum_drone = np.cumsum(net["frame_len"][dir_mask_drone])
+        cum_gcs = np.cumsum(net["frame_len"][dir_mask_gcs])
+        ax12.plot(t_net[dir_mask_drone], cum_drone / 1024,
+                  color=c_to_drone, linewidth=1, label="GCS → Drone")
+        ax12.plot(t_net[dir_mask_gcs], cum_gcs / 1024,
+                  color=c_to_gcs, linewidth=1, label="Drone → GCS")
+        ax12.set_xlabel("Time (s)")
+        ax12.set_ylabel("Cumulative Data (KB)")
+        ax12.set_title("Traffic Volume per Direction")
+        ax12.legend(fontsize=8)
+        ax12.grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
 
     if save:
         out_path = dataset_dir / f"{mission_id}_visualization.png"

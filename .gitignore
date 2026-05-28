@@ -53,3 +53,6 @@ dataset/pcap/
 dataset/telemetry/
 dataset/phase_labels/
 dataset/validation_report.csv
+
+# ignore data visualization
+dataset/*_visualization.png
