@@ -228,19 +228,20 @@ class Orchestrator:
                 blocking=True, timeout=2.0
             )
 
+            # Periodic armed check — runs regardless of msg
+            if time.time() > min_flight_time and time.time() - last_armed_check > 5:
+                last_armed_check = time.time()
+                hb = self.conn.recv_match(
+                    type="HEARTBEAT", blocking=False
+                )
+                if hb and hb.type == mavutil.mavlink.MAV_TYPE_QUADROTOR:
+                    armed = hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                    if not armed and len(reached) > 0:
+                        log.info(f"  Vehicle disarmed — mission done. "
+                                 f"WPs reached: {len(reached)}")
+                        return True, reached
+
             if msg is None:
-                # No mission message — check armed status periodically
-                if time.time() > min_flight_time and time.time() - last_armed_check > 5:
-                    last_armed_check = time.time()
-                    hb = self.conn.recv_match(
-                        type="HEARTBEAT", blocking=True, timeout=2.0
-                    )
-                    if hb and hb.type == mavutil.mavlink.MAV_TYPE_QUADROTOR:
-                        armed = hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                        if not armed and len(reached) > 0:
-                            log.info(f"  Vehicle disarmed — mission done. "
-                                     f"WPs reached: {len(reached)}")
-                            return True, reached
                 continue
 
             mtype = msg.get_type()
@@ -533,11 +534,21 @@ class Orchestrator:
                     notify("[UAV-IDS] 5 consecutive failures — stopping orchestrator.")
                     log.error("5 consecutive failures — stopping.")
                     self.keep_running = False
+                    # Write stop flag so container restart also stops
+                    (self.output_dir / ".stop_orchestrator").touch()
 
             self.reboot_sitl()
 
     def run(self):
         """Iterate manifest, skip completed/failed, run pending missions."""
+        
+        stop_flag = self.output_dir / ".stop_orchestrator"
+        if stop_flag.exists():
+            log.error("Stop flag found — previous run had 5 consecutive failures. "
+                      "Delete .stop_orchestrator to resume.")
+            notify("[UAV-IDS] Stop flag present — orchestrator not starting.")
+            return
+        
         self.connect()
 
         with open(self.manifest_path, "r", newline="") as f:
