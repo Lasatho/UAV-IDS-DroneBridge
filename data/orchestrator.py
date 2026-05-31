@@ -199,20 +199,25 @@ class Orchestrator:
             log.warning(f"  Mission upload issue: {ack}")
 
     def estimate_mission_timeout(self, wp_path: Path, meta: dict) -> int:
-        """Estimate max mission duration from waypoint count and speed."""
+        """Estimate max mission duration from waypoint count, speed, and RTL altitude."""
         with open(wp_path, "r") as f:
-            n_lines = sum(1 for _ in f) - 1  # minus header
+            n_lines = sum(1 for _ in f) - 1
 
         speed_cms = meta["drone_params"].get("WPNAV_SPEED", 500)
         speed_ms = speed_cms / 100.0
 
-        # Rough estimate: assume average 200m between waypoints
-        # + 60s for takeoff/RTL/landing overhead
-        # + 2x safety factor
-        estimated_s = (n_lines * 200.0 / max(speed_ms, 1.0)) + 60
+        # RTL overhead: climb to RTL_ALT, fly home, descend, land
+        rtl_alt_cm = meta["drone_params"].get("RTL_ALT", 3000)
+        speed_up_cms = meta["drone_params"].get("WPNAV_SPEED_UP", 250)
+        speed_dn_cms = meta["drone_params"].get("WPNAV_SPEED_DN", 150)
+        rtl_overhead_s = (rtl_alt_cm / speed_up_cms) + (rtl_alt_cm / speed_dn_cms) + 60
+
+        # Flight time + RTL + safety factor
+        flight_s = n_lines * 200.0 / max(speed_ms, 1.0)
+        estimated_s = flight_s + rtl_overhead_s
         timeout = max(300, int(estimated_s * 2))
-        log.info(f"  Mission timeout: {timeout}s (estimated {estimated_s:.0f}s, "
-                 f"{n_lines} WPs, {speed_ms:.1f} m/s)")
+        log.info(f"  Mission timeout: {timeout}s (flight={flight_s:.0f}s, "
+                 f"rtl={rtl_overhead_s:.0f}s, {n_lines} WPs, {speed_ms:.1f} m/s)")
         return timeout
 
     def wait_mission_complete(self, timeout=900):
