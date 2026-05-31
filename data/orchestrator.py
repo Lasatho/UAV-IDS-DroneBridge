@@ -220,26 +220,12 @@ class Orchestrator:
         deadline = time.time() + timeout
         min_flight_time = time.time() + 120
         reached = set()
-        last_armed_check = 0
 
         while time.time() < deadline and self.keep_running:
             msg = self.conn.recv_match(
-                type=["STATUSTEXT", "MISSION_ITEM_REACHED"],
+                type=["STATUSTEXT", "MISSION_ITEM_REACHED", "HEARTBEAT"],
                 blocking=True, timeout=2.0
             )
-
-            # Periodic armed check — runs regardless of msg
-            if time.time() > min_flight_time and time.time() - last_armed_check > 5:
-                last_armed_check = time.time()
-                hb = self.conn.recv_match(
-                    type="HEARTBEAT", blocking=False
-                )
-                if hb and hb.type == mavutil.mavlink.MAV_TYPE_QUADROTOR:
-                    armed = hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                    if not armed and len(reached) > 0:
-                        log.info(f"  Vehicle disarmed — mission done. "
-                                 f"WPs reached: {len(reached)}")
-                        return True, reached
 
             if msg is None:
                 continue
@@ -257,6 +243,16 @@ class Orchestrator:
                     "Auto disarmed" in text or
                     "Disarming motors" in text):
                     log.info(f"  Mission complete! WPs reached: {len(reached)}")
+                    return True, reached
+
+            elif mtype == "HEARTBEAT":
+                # Only process quadrotor heartbeats, ignore GCS/MAVProxy
+                if msg.type != mavutil.mavlink.MAV_TYPE_QUADROTOR:
+                    continue
+                armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                if not armed and len(reached) > 0 and time.time() > min_flight_time:
+                    log.info(f"  Vehicle disarmed — mission done. "
+                             f"WPs reached: {len(reached)}")
                     return True, reached
 
         log.warning(f"  Timeout. Waypoints reached: {len(reached)}")
