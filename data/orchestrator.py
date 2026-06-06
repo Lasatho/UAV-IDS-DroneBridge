@@ -22,6 +22,7 @@ import csv
 import os
 from pathlib import Path
 from datetime import datetime
+import math
 
 from pymavlink import mavutil
 
@@ -199,25 +200,45 @@ class Orchestrator:
             log.warning(f"  Mission upload issue: {ack}")
 
     def estimate_mission_timeout(self, wp_path: Path, meta: dict) -> int:
-        """Estimate max mission duration from waypoint count, speed, and RTL altitude."""
+        """Estimate max mission duration from actualy waypoint distances"""
+        wps = []
         with open(wp_path, "r") as f:
-            n_lines = sum(1 for _ in f) - 1
+            f.readline()    # skip header
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) < 12:
+                    continue
+            cmd = int(parts[3])
+            if cmd in (16,22):
+                lat = float(parts[8])
+                lon = float(parts[9])
+                alt = float(parts[10])
+                if lat != 0.0 or lon != 0.0:
+                    wps.append((lat, lon, alt))
+
+        # calculate total distance between consecutive waypoints
+        total_dist = 0.0
+        R = 6378137.0
+        for i in range(1, len(wps)):
+            dlat = math.radians(wps[i][0] - wps[i-1][0])
+            dlon = math.radians(wps[i][1] - wps[i-1][1])
+            a = (math.sin(dlat/2)**2 + math.cos(math.radians(wps[i-1][0])) * math.cos(math.radians(wps[i][0])) * math.sin(dlon/2)**2)
+            total_dist += R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
         speed_cms = meta["drone_params"].get("WPNAV_SPEED", 500)
         speed_ms = speed_cms / 100.0
 
-        # RTL overhead: climb to RTL_ALT, fly home, descend, land
+        # RTL overhead
         rtl_alt_cm = meta["drone_params"].get("RTL_ALT", 3000)
         speed_up_cms = meta["drone_params"].get("WPNAV_SPEED_UP", 250)
         speed_dn_cms = meta["drone_params"].get("WPNAV_SPEED_DN", 150)
-        rtl_overhead_s = (rtl_alt_cm / speed_up_cms) + (rtl_alt_cm / speed_dn_cms) + 60
+        rtl_overhead_s= (rtl_alt_cm  / speed_up_cms) + (rtl_alt_cm / speed_dn_cms) + 60
 
-        # Flight time + RTL + safety factor
-        flight_s = n_lines * 200.0 / max(speed_ms, 1.0)
+        flight_s = total_dist / max(speed_ms, 1.0)
         estimated_s = flight_s + rtl_overhead_s
-        timeout = max(300, int(estimated_s * 2))
+        timeout = max(300, int(estimated_s * 2.5))
         log.info(f"  Mission timeout: {timeout}s (flight={flight_s:.0f}s, "
-                 f"rtl={rtl_overhead_s:.0f}s, {n_lines} WPs, {speed_ms:.1f} m/s)")
+                 f"dist={total_dist:.0f}m, rtl={rtl_overhead_s:.0f}s, {speed_ms:.1f} m/s)")
         return timeout
 
     def wait_mission_complete(self, timeout=900):

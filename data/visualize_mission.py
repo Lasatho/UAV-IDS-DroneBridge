@@ -315,15 +315,23 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
         dir_mask_drone = net["direction"] == 1   # to drone
         dir_mask_gcs = net["direction"] == 3     # to GCS
 
-        # --- 9. Frame Timeline (size over time, colored by direction) ---
+        # Bin into 2s windows for frame rate
+        t_max = max(t_net[-1], t_gpi[-1]) if len(t_gpi) > 0 else t_net[-1]
+        bin_edges = np.arange(0, t_max + 2, 2.0)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+        fr_to_drone = np.histogram(t_net[dir_mask_drone], bins=bin_edges)[0] / 2.0
+        fr_to_gcs = np.histogram(t_net[dir_mask_gcs], bins=bin_edges)[0] / 2.0
+
+        # --- 9. Frame Rate over Time ---
         ax9 = fig.add_subplot(n_rows, 2, 9)
-        ax9.scatter(t_net[dir_mask_drone], net["frame_len"][dir_mask_drone],
-                    s=8, alpha=0.6, c=c_to_drone, label="GCS → Drone", zorder=3)
-        ax9.scatter(t_net[dir_mask_gcs], net["frame_len"][dir_mask_gcs],
-                    s=8, alpha=0.6, c=c_to_gcs, label="Drone → GCS", zorder=3)
+        ax9.bar(bin_centers - 0.4, fr_to_gcs, width=1.6, alpha=0.7,
+                color=c_to_gcs, label="Drone → GCS")
+        ax9.bar(bin_centers + 0.4, fr_to_drone, width=1.6, alpha=0.7,
+                color=c_to_drone, label="GCS → Drone")
         ax9.set_xlabel("Time (s)")
-        ax9.set_ylabel("Frame Length (bytes)")
-        ax9.set_title("DroneBridge Frame Timeline")
+        ax9.set_ylabel("Frames / s")
+        ax9.set_title("DroneBridge Frame Rate")
         ax9.legend(fontsize=8)
         ax9.grid(True, alpha=0.3)
 
@@ -335,36 +343,56 @@ def plot_mission(dataset_dir: Path, mission_id: str, save: bool = False):
         ax10.hist(net["payload_len"][dir_mask_gcs], bins=bins, alpha=0.7,
                   color=c_to_gcs, label="Drone → GCS")
         ax10.set_xlabel("Payload Length (bytes)")
-        ax10.set_ylabel("Count")
+        ax10.set_ylabel("Frame Count")
         ax10.set_title("Payload Size Distribution")
         ax10.legend(fontsize=8)
         ax10.grid(True, alpha=0.3)
 
-        # --- 11. Sequence Number Progression ---
-        ax11 = fig.add_subplot(n_rows, 2, 11)
-        ax11.scatter(t_net[dir_mask_drone], net["seq_num"][dir_mask_drone],
-                     s=5, alpha=0.6, c=c_to_drone, label="GCS → Drone")
-        ax11.scatter(t_net[dir_mask_gcs], net["seq_num"][dir_mask_gcs],
-                     s=5, alpha=0.6, c=c_to_gcs, label="Drone → GCS")
-        ax11.set_xlabel("Time (s)")
-        ax11.set_ylabel("Sequence Number")
-        ax11.set_title("Sequence Number Progression")
-        ax11.legend(fontsize=8)
-        ax11.grid(True, alpha=0.3)
+        # --- 11. Summary Table ---
+        ax11 = fig.add_subplot(n_rows, 2, (11, 12))
+        ax11.axis("off")
 
-        # --- 12. Cumulative Bytes per Direction ---
-        ax12 = fig.add_subplot(n_rows, 2, 12)
-        cum_drone = np.cumsum(net["frame_len"][dir_mask_drone])
-        cum_gcs = np.cumsum(net["frame_len"][dir_mask_gcs])
-        ax12.plot(t_net[dir_mask_drone], cum_drone / 1024,
-                  color=c_to_drone, linewidth=1, label="GCS → Drone")
-        ax12.plot(t_net[dir_mask_gcs], cum_gcs / 1024,
-                  color=c_to_gcs, linewidth=1, label="Drone → GCS")
-        ax12.set_xlabel("Time (s)")
-        ax12.set_ylabel("Cumulative Data (KB)")
-        ax12.set_title("Traffic Volume per Direction")
-        ax12.legend(fontsize=8)
-        ax12.grid(True, alpha=0.3)
+        n_total = len(t_net)
+        n_to_drone = int(dir_mask_drone.sum())
+        n_to_gcs = int(dir_mask_gcs.sum())
+        bytes_to_drone = net["frame_len"][dir_mask_drone].sum()
+        bytes_to_gcs = net["frame_len"][dir_mask_gcs].sum()
+        avg_payload_drone = (net["payload_len"][dir_mask_drone].mean()
+                             if n_to_drone > 0 else 0)
+        avg_payload_gcs = (net["payload_len"][dir_mask_gcs].mean()
+                           if n_to_gcs > 0 else 0)
+        mission_dur = t_net[-1] - t_net[0] if len(t_net) > 1 else 0
+        avg_fps = n_total / max(mission_dur, 1)
+
+        table_data = [
+            ["Total Frames", f"{n_total}"],
+            ["Drone → GCS", f"{n_to_gcs} frames ({bytes_to_gcs/1024:.1f} KB)"],
+            ["GCS → Drone", f"{n_to_drone} frames ({bytes_to_drone/1024:.1f} KB)"],
+            ["Avg Payload Drone→GCS", f"{avg_payload_gcs:.0f} bytes"],
+            ["Avg Payload GCS→Drone", f"{avg_payload_drone:.0f} bytes"],
+            ["Avg Frame Rate", f"{avg_fps:.1f} frames/s"],
+            ["DL/UL Ratio", f"{bytes_to_gcs/max(bytes_to_drone,1):.1f}:1"],
+            ["Comm ID / Port", f"{int(net['comm_id'][0])} / {int(net['port'][0])}"],
+            ["Duration", f"{mission_dur:.1f}s"],
+        ]
+
+        table = ax11.table(
+            cellText=table_data,
+            colLabels=["Metric", "Value"],
+            cellLoc="center",
+            colColours=["#E3F2FD", "#E3F2FD"],
+            loc="center",
+            colWidths=[0.35, 0.35]
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1, 1.8)
+        for key, cell in table.get_celld().items():
+            cell.set_edgecolor("#BBDEFB")
+            if key[0] == 0:
+                cell.set_facecolor("#1565C0")
+                cell.set_text_props(color="white", fontweight="bold")
+        ax11.set_title("Network Summary", fontsize=13, fontweight="bold", pad=20)
 
     plt.tight_layout(rect=[0, 0, 1, 0.97])
 
