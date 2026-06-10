@@ -1,0 +1,98 @@
+# === Default Configuration ===
+# Base config for UAV-IDS training pipeline.
+# Override per experiment via CLI or experiment-specific YAML.
+
+seed: 42
+
+# --- Data ---
+data:
+  dataset_dir: "./dataset"
+  telemetry_dir: "${data.dataset_dir}/telemetry"
+  network_dir: "${data.dataset_dir}/network"  # future use
+
+  # Resampling: align all message types to common frequency
+  resample_freq_hz: 10  # Hz
+
+  # Sliding window
+  window_length: 64     # timesteps per sample
+  window_stride: 16     # stride between windows
+
+  # Train/val/test split (mission-level, no data leakage)
+  split_ratios: [0.70, 0.15, 0.15]
+  split_seed: 42
+
+  # Feature groups (set false to exclude)
+  features:
+    GLOBAL_POSITION_INT: true
+    GPS_RAW_INT: true
+    RAW_IMU: true
+    SCALED_PRESSURE: true
+    SERVO_OUTPUT_RAW: true
+
+  # Normalization
+  normalization: "zscore"  # zscore | minmax | none
+
+  # Dataloader
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+
+# --- Model ---
+model:
+  name: "rssm"  # rssm | mts_jepa | hassler
+
+  rssm:
+    stochastic_dim: 32
+    deterministic_dim: 128
+    hidden_dim: 256
+    kl_dyn_beta: 0.5
+    kl_rep_beta: 0.1
+    free_nats: 1.0
+
+  mts_jepa:
+    patch_length: 8
+    embed_dim: 128
+    depth: 4
+    num_heads: 4
+    predictor_depth: 2
+    mask_ratio: 0.5
+    ema_decay: 0.996
+
+  hassler:
+    conv_channels: [64, 128]
+    kernel_size: 5
+    lstm_hidden: 128
+    lstm_layers: 1
+    dropout: 0.1
+
+# --- Training ---
+training:
+  epochs: 100
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  scheduler: "cosine"       # cosine | step | none
+  warmup_epochs: 5
+  grad_clip_norm: 1.0
+  early_stopping_patience: 15
+
+  # Checkpointing
+  checkpoint_dir: "./checkpoints"
+  save_every_n_epochs: 10
+
+# --- Evaluation ---
+evaluation:
+  metrics: ["precision", "recall", "f1", "auc_roc", "auc_pr", "fpr", "detection_latency"]
+  threshold_strategy: "best_f1"  # best_f1 | fixed | percentile
+
+# --- Export ---
+export:
+  onnx: true
+  tensorrt: true
+  precision: ["fp32", "fp16", "int8"]
+  calibration_samples: 1000  # for INT8 calibration
+
+# --- Logging ---
+logging:
+  backend: "wandb"  # wandb | tensorboard | none
+  project: "uav-ids-dronebridge"
+  log_every_n_steps: 50
