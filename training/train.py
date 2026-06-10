@@ -26,7 +26,7 @@ import torch
 
 from data import build_dataloaders, get_num_features
 from models import build_model
-from utils.config import load_config, set_seed
+from config import load_config, set_seed
 
 logger = logging.getLogger("train")
 
