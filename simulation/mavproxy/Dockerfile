@@ -15,4 +15,5 @@ RUN pip3 install \
 CMD ["mavproxy.py", \
      "--master=tcp:127.0.0.1:5750", \
      "--out=udp:127.0.0.1:14552", \
+     "--out=udp:127.0.0.1:14554",\
      "--non-interactive"]

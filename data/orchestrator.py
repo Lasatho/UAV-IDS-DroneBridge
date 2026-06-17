@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 import math
+import random
 
 from pymavlink import mavutil
 
@@ -200,7 +201,7 @@ class Orchestrator:
             log.warning(f"  Mission upload issue: {ack}")
 
     def estimate_mission_timeout(self, wp_path: Path, meta: dict) -> int:
-        """Fixed 30 minute timeout for all missions."""
+        """Fuck this. Fixed 30 minute timeout for all missions."""
         return 1800
         # """Estimate max mission duration from actualy waypoint distances"""
         # wps = []
@@ -242,49 +243,6 @@ class Orchestrator:
         # log.info(f"  Mission timeout: {timeout}s (flight={flight_s:.0f}s, "
         #          f"dist={total_dist:.0f}m, rtl={rtl_overhead_s:.0f}s, {speed_ms:.1f} m/s)")
         # return timeout
-
-    def wait_mission_complete(self, timeout=900):
-        log.info(f"  Waiting for mission complete (timeout={timeout}s)...")
-        deadline = time.time() + timeout
-        min_flight_time = time.time() + 120
-        reached = set()
-
-        while time.time() < deadline and self.keep_running:
-            msg = self.conn.recv_match(
-                type=["STATUSTEXT", "MISSION_ITEM_REACHED", "HEARTBEAT"],
-                blocking=True, timeout=2.0
-            )
-
-            if msg is None:
-                continue
-
-            mtype = msg.get_type()
-
-            if mtype == "MISSION_ITEM_REACHED":
-                reached.add(msg.seq)
-                log.info(f"  WP {msg.seq} reached ({len(reached)} total)")
-
-            elif mtype == "STATUSTEXT":
-                text = msg.text.strip()
-                log.info(f"  STATUSTEXT: {text}")
-                if ("Mission Complete" in text or
-                    "Auto disarmed" in text or
-                    "Disarming motors" in text):
-                    log.info(f"  Mission complete! WPs reached: {len(reached)}")
-                    return True, reached
-
-            elif mtype == "HEARTBEAT":
-                # Only process quadrotor heartbeats, ignore GCS/MAVProxy
-                if msg.type != mavutil.mavlink.MAV_TYPE_QUADROTOR:
-                    continue
-                armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                if not armed and len(reached) > 0 and time.time() > min_flight_time:
-                    log.info(f"  Vehicle disarmed — mission done. "
-                             f"WPs reached: {len(reached)}")
-                    return True, reached
-
-        log.warning(f"  Timeout. Waypoints reached: {len(reached)}")
-        return False, reached
 
     def configure_wind(self, wind_params: dict, wind_direction_deg: int):
         """Placeholder: configure Gazebo wind plugin for this mission."""
@@ -407,8 +365,116 @@ class Orchestrator:
             ]
         )
 
+    def start_attack(self, attack_type: str, mission_id: str) -> subprocess.Popen:
+        """Start an attack script as a subprocess."""
+        script = Path(f"attacks/{attack_type}.py")
+        log.info(f"[!] Starting attack: {attack_type}")
+        return subprocess.Popen(
+            ["python3", str(script), "--mission-id", mission_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE
+        )
+    
+    def wait_mission_complete(self, timeout=900, attack_type="none",
+                              attack_start_offset=None, attack_duration=None,
+                              mission_id=None):
+        log.info(f"  Waiting for mission complete (timeout={timeout}s)...")
+        deadline = time.time() + timeout
+        min_flight_time = time.time() + 60
+        reached = set()
+        first_wp_time = None
+
+        # Attack state
+        attack_proc = None
+        attack_started = False
+        attack_start_ts = None
+        attack_end_ts = None
+        attack_ready = False  # True once first WP reached + 60s flying
+
+        while time.time() < deadline and self.keep_running:
+            msg = self.conn.recv_match(
+                type=["STATUSTEXT", "MISSION_ITEM_REACHED", "HEARTBEAT"],
+                blocking=True, timeout=2.0
+            )
+
+            # Check if attack conditions are met
+            if (not attack_ready and attack_type != "none"
+                    and first_wp_time is not None
+                    and time.time() > min_flight_time
+                    and time.time() - first_wp_time > 10):
+                attack_ready = True
+                log.info(f"  Attack window open (first WP + 60s flying)")
+
+            # Start attack at randomized offset
+            if (attack_ready and not attack_started
+                    and attack_start_offset is not None
+                    and time.time() - first_wp_time >= attack_start_offset):
+                attack_proc = self.start_attack(attack_type, mission_id)
+                attack_start_ts = time.time()
+                attack_started = True
+                log.info(f"  [!] Attack {attack_type} STARTED at offset "
+                         f"{time.time() - first_wp_time:.0f}s")
+
+            # Stop attack after duration
+            if (attack_started and attack_proc is not None
+                    and attack_end_ts is None
+                    and time.time() - attack_start_ts >= attack_duration):
+                attack_proc.terminate()
+                attack_proc.wait()
+                attack_end_ts = time.time()
+                log.info(f"  [!] Attack {attack_type} STOPPED after "
+                         f"{attack_duration:.0f}s")
+
+            if msg is None:
+                continue
+
+            mtype = msg.get_type()
+
+            if mtype == "MISSION_ITEM_REACHED":
+                reached.add(msg.seq)
+                if first_wp_time is None:
+                    first_wp_time = time.time()
+                log.info(f"  WP {msg.seq} reached ({len(reached)} total)")
+
+            elif mtype == "STATUSTEXT":
+                text = msg.text.strip()
+                log.info(f"  STATUSTEXT: {text}")
+                if ("Mission Complete" in text or
+                    "Auto disarmed" in text or
+                    "Disarming motors" in text):
+                    log.info(f"  Mission complete! WPs reached: {len(reached)}")
+                    # Clean up attack if still running
+                    if attack_proc is not None and attack_end_ts is None:
+                        attack_proc.terminate()
+                        attack_proc.wait()
+                        attack_end_ts = time.time()
+                    return True, reached, attack_start_ts, attack_end_ts
+
+            elif mtype == "HEARTBEAT":
+                if msg.type != mavutil.mavlink.MAV_TYPE_QUADROTOR:
+                    continue
+                armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                if not armed and len(reached) > 0 and time.time() > min_flight_time:
+                    log.info(f"  Vehicle disarmed — mission done. "
+                             f"WPs reached: {len(reached)}")
+                    if attack_proc is not None and attack_end_ts is None:
+                        attack_proc.terminate()
+                        attack_proc.wait()
+                        attack_end_ts = time.time()
+                    return True, reached, attack_start_ts, attack_end_ts
+
+        # Timeout — clean up attack
+        if attack_proc is not None and attack_end_ts is None:
+            attack_proc.terminate()
+            attack_proc.wait()
+            attack_end_ts = time.time()
+
+        log.warning(f"  Timeout. Waypoints reached: {len(reached)}")
+        return False, reached, attack_start_ts, attack_end_ts
+    
     def write_label(self, run_id: str, start_time: float, end_time: float,
-                    attack_type: str = "none", waypoints_reached: list = None,
+                    attack_type: str = "none", attack_start: float = None,
+                    attack_end: float = None, waypoints_reached: list = None,
                     mission_success: bool = False):
         label = {
             "run_id": run_id,
@@ -418,8 +484,9 @@ class Orchestrator:
             "mission_success": mission_success,
             "waypoints_reached": waypoints_reached or [],
             "attack_type": attack_type,
-            "attack_start": None,
-            "attack_end": None,
+            "attack_start": attack_start,
+            "attack_end": attack_end,
+            "attack_duration": (attack_end - attack_start) if (attack_start and attack_end) else None,
             "notes": ""
         }
         label_path = self.output_dir / "phase_labels" / f"{run_id}.json"
@@ -504,6 +571,10 @@ class Orchestrator:
         start_time = time.time()
         success = False
         reached_wps = set()
+
+        atk_start = None
+        atk_end = None
+            
         try:
             if not self.wait_for_ready():
                 raise RuntimeError("No GPS fix")
@@ -525,9 +596,26 @@ class Orchestrator:
             # Now switch to AUTO — mission continues from WP2
             self.set_mode("AUTO")
 
+            # Attack scheduling
+            attack_type = meta.get("attack_type", "none")
+            attack_start_offset = None
+            attack_duration = None
+
+            if attack_type != "none":
+                # Randomized: start 60-180s after first WP, duration 15-60s
+                attack_start_offset = random.uniform(60, 180)
+                attack_duration = random.uniform(15, 60)
+                log.info(f"  Attack scheduled: {attack_type}, "
+                         f"offset={attack_start_offset:.0f}s, "
+                         f"duration={attack_duration:.0f}s")
+
             mission_timeout = self.estimate_mission_timeout(wp_path, meta)
-            success, reached_wps = self.wait_mission_complete(
-                timeout=mission_timeout
+            success, reached_wps, atk_start, atk_end = self.wait_mission_complete(
+                timeout=mission_timeout,
+                attack_type=attack_type,
+                attack_start_offset=attack_start_offset,
+                attack_duration=attack_duration,
+                mission_id=mission_id
             )
 
             if not success:
@@ -541,13 +629,15 @@ class Orchestrator:
             telemetry_proc.terminate()
             telemetry_proc.wait()
             self.write_label(mission_id, start_time, end_time,
+                             attack_type=meta.get("attack_type", "none"),
+                             attack_start=atk_start,
+                             attack_end=atk_end,
                              waypoints_reached=list(reached_wps),
                              mission_success=success)
             status = "completed" if success else "failed"
             self.update_manifest_status(mission_id, status)
             log.info(f"=== {mission_id} {status} ({end_time - start_time:.1f}s) ===")
 
-            # Track consecutive failures
             if success:
                 self.consecutive_failures = 0
             else:
@@ -558,7 +648,6 @@ class Orchestrator:
                     notify("[UAV-IDS] 5 consecutive failures — stopping orchestrator.")
                     log.error("5 consecutive failures — stopping.")
                     self.keep_running = False
-                    # Write stop flag so container restart also stops
                     (self.output_dir / ".stop_orchestrator").touch()
 
             self.reboot_sitl()
