@@ -53,6 +53,19 @@ dataset/pcap/
 dataset/telemetry/
 dataset/phase_labels/
 dataset/validation_report.csv
+dataset/cache/
+
+# dataset/testing/flypaw/ — track the reference dataset itself, ignore
+# the CSVs/cache generated from it by data/flypaw_to_telemetry.py /
+# training/preprocess.py (regenerable, see README "Cache-Only Deploy")
+dataset/testing/flypaw/telemetry/
+dataset/testing/flypaw/cache/
+
+# exceeds GitHub's 100 MB hard limit — never commit
+dataset/testing/UAV-NDD CSV.zip
 
 # ignore data visualization
 dataset/*_visualization.png
+
+# local-only assistant instructions — never pushed to GitHub
+CLAUDE.md

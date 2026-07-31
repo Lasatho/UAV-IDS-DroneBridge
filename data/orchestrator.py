@@ -246,7 +246,7 @@ class Orchestrator:
 
     def configure_wind(self, wind_params: dict, wind_direction_deg: int):
         """Placeholder: configure Gazebo wind plugin for this mission."""
-        # TODO: Implement via gz service call or SDF patching
+        # TODO: Implement via gz service call or SDF patching for next simulation 
         log.info(f"  Wind: {wind_params}, direction={wind_direction_deg}°")
 
     def update_manifest_status(self, mission_id: str, new_status: str):

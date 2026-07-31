@@ -148,6 +148,12 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
 
     Side effects: writes split assignment and normalizer stats to
     `<dataset_dir>/cache/` for reproducibility.
+
+    Cache-only mode: if telemetry_dir has no mission CSVs but a complete
+    cache (splits.json + normalizer.json + one .npy per mission) exists
+    for this frequency/feature combination, missions are loaded straight
+    from the cache. This is the deploy path — the cache directory alone
+    (no raw CSVs) is a sufficient, portable training artifact.
     """
     dataset_dir = Path(cfg["dataset_dir"])
     telemetry_dir = Path(cfg["telemetry_dir"])
@@ -155,21 +161,46 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
     feature_cols = get_feature_columns(enabled)
     freq = float(cfg["resample_freq_hz"])
     cache_dir = _cache_dir(dataset_dir, freq, feature_cols)
+    logger.info("Cache directory: %s", cache_dir)
 
-    mission_ids = discover_missions(telemetry_dir)
-    if not mission_ids:
-        raise RuntimeError(f"No complete missions found in {telemetry_dir}")
+    splits_path = cache_dir / "splits.json"
+    norm_path = cache_dir / "normalizer.json"
+    have_csvs = telemetry_dir.exists() and any(telemetry_dir.glob("mission_*_*.csv"))
+    cache_only = not have_csvs and splits_path.exists() and norm_path.exists()
 
-    max_missions = cfg.get("max_missions")
-    if max_missions:
-        mission_ids = mission_ids[: int(max_missions)]
-    logger.info("Using %d missions", len(mission_ids))
+    if cache_only:
+        splits = json.loads(splits_path.read_text())
+        missing = [
+            mid
+            for ids in splits.values()
+            for mid in ids
+            if not (cache_dir / f"{mid}.npy").exists()
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Cache-only load requested ({telemetry_dir} has no CSVs) "
+                f"but cache is missing .npy for: {missing}"
+            )
+        n_missions = sum(len(ids) for ids in splits.values())
+        logger.info(
+            "No telemetry CSVs in %s — loading %d missions from cache-only artifact %s",
+            telemetry_dir, n_missions, cache_dir,
+        )
+    else:
+        mission_ids = discover_missions(telemetry_dir)
+        if not mission_ids:
+            raise RuntimeError(f"No complete missions found in {telemetry_dir}")
 
-    splits = split_missions(
-        mission_ids,
-        ratios=tuple(cfg["split_ratios"]),
-        seed=int(cfg["split_seed"]),
-    )
+        max_missions = cfg.get("max_missions")
+        if max_missions:
+            mission_ids = mission_ids[: int(max_missions)]
+        logger.info("Using %d missions", len(mission_ids))
+
+        splits = split_missions(
+            mission_ids,
+            ratios=tuple(cfg["split_ratios"]),
+            seed=int(cfg["split_seed"]),
+        )
 
     # Load (with cache) per split; skip missions that fail alignment.
     arrays: dict[str, list[np.ndarray]] = {}
@@ -190,7 +221,6 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
         raise RuntimeError("Training split is empty after loading")
 
     # Normalizer: fit on train only, persist next to the cache.
-    norm_path = cache_dir / "normalizer.json"
     if norm_path.exists():
         normalizer = Normalizer.load(norm_path)
         if normalizer.columns != feature_cols:

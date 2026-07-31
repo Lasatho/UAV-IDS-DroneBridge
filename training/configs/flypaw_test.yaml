@@ -1,0 +1,50 @@
+# === FlyPaw smoke-test overlay ===
+# Runs the training pipeline (discovery -> alignment -> windowing ->
+# normalization -> training) against the real FlyPaw/AERPAW reference
+# recordings converted by data/flypaw_to_telemetry.py, instead of
+# simulated SITL missions. Purpose: exercise the pipeline end to end on
+# real data, not to produce a meaningful IDS model — only 7 short
+# missions, GPS-derived features only, no attack labels.
+#
+# Usage:
+#   python3 data/flypaw_to_telemetry.py
+#   cd training
+#   python train.py --config configs/default.yaml --experiment configs/flypaw_test.yaml model.name=rssm
+
+data:
+  dataset_dir: "../dataset/testing/flypaw"
+  telemetry_dir: "${data.dataset_dir}/telemetry"
+
+  # Native cadence is ~1 Hz (2022-01-13 run) / ~0.1 Hz (2022-03-11 run);
+  # the SITL-tuned 10 Hz default would mean each raw fix gets forward-filled
+  # across 10-100 grid points.
+  resample_freq_hz: 1
+
+  # Shortest mission has 180-189 samples (~3 min); keep windows well below that.
+  window_length: 32
+  window_stride: 8
+
+  # 7 missions total -> ~5 train / ~1 val / ~1 test.
+  split_ratios: [0.70, 0.15, 0.15]
+  split_seed: 42
+
+  # FlyPaw has no IMU, barometer or servo data (see
+  # dataset/testing/flypaw/README.md) — only GPS/position is real.
+  features:
+    GLOBAL_POSITION_INT: true
+    GPS_RAW_INT: true
+    RAW_IMU: false
+    SCALED_PRESSURE: false
+    SERVO_OUTPUT_RAW: false
+
+  batch_size: 8
+  num_workers: 0
+  pin_memory: false
+
+training:
+  epochs: 20
+  early_stopping_patience: 20
+  checkpoint_dir: "./checkpoints_flypaw_test"
+
+logging:
+  backend: "none"

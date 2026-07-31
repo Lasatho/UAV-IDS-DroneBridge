@@ -71,6 +71,7 @@ UAV-IDS-DroneBridge/
 │   └── start_sim.sh             # Startskript für die Simulation
 │
 ├── training/                    # ML-Trainings-Pipeline
+│   ├── preprocess.py            # Nur Datenverarbeitung (bis .npy-Cache, kein Training)
 │   ├── train.py                 # Einheitlicher Trainingseinstiegspunkt
 │   ├── evaluate.py              # Auswertung (unlabeled + labeled)
 │   ├── export.py                # ONNX-Export + Paritätsprüfung
@@ -269,6 +270,122 @@ Default-Parameter (in `configs/default.yaml`):
 - Normalisierung: Z-Score
 - Features: alle 5 Nachrichtentypen → 37 Features
 
+#### Cache-Only Deploy (Cloud-Transfer)
+
+Datenverarbeitung und Training laufen typischerweise auf unterschiedlichen
+Maschinen (Simulation/Vorverarbeitung lokal, Training auf einem separaten
+Trainingsrechner). Der `.npy`-Cache-Ordner ist dafür ein eigenständiges,
+portables Artefakt — er kann ohne die rohen Telemetrie-CSVs kopiert werden
+(z.B. manueller Upload in eine Cloud-Ablage, Download auf dem
+Trainingsrechner):
+
+```
+dataset/cache/{freq}hz_{feature_hash}/
+    ├── mission_00001.npy   # ein (T, n_features) float32-Array pro Mission
+    ├── mission_00002.npy
+    ├── ...
+    ├── normalizer.json     # Z-Score-Statistiken, nur auf train-Split gefittet
+    └── splits.json         # Train/Val/Test-Mission-Zuordnung
+```
+
+`build_datasets()` (`training/data/dataset.py`) erkennt automatisch, ob
+`telemetry_dir` Missions-CSVs enthält. Ist das nicht der Fall, aber ein
+vollständiger Cache (`splits.json` + `normalizer.json` + alle referenzierten
+`.npy`-Dateien) für die konfigurierte `resample_freq_hz`/`features`-Kombination
+vorhanden, wird ausschließlich daraus geladen — auf dem Trainingsrechner
+werden dann keine Rohdaten benötigt.
+
+**Schritt 1: Datenverarbeitung (Maschine mit Zugriff auf `dataset/telemetry/`):**
+
+```bash
+cd training
+python preprocess.py --config configs/default.yaml
+```
+
+Läuft nur bis zum Cache (kein Training). Die Logausgabe nennt den exakten
+Pfad, z.B.:
+
+```
+Cache directory: ./dataset/cache/10hz_3f2a9c1d
+```
+
+**Schritt 2: Upload:** Genau diesen Ordner (`dataset/cache/<freq>hz_<hash>/`)
+in die Cloud-Ablage hochladen.
+
+**Schritt 3: Download auf dem Trainingsrechner:** Ordner unverändert nach
+`<dataset_dir>/cache/<freq>hz_<hash>/` legen — gleicher `dataset_dir` und
+gleicher Ordnername wie in Schritt 1/2 (der Hash im Namen hängt von
+`resample_freq_hz` und den aktivierten `features` ab; weicht die Config ab,
+wird der Cache nicht gefunden und `discover_missions()` verlangt wieder die
+Roh-CSVs). `dataset/telemetry/` muss auf dem Trainingsrechner nicht existieren.
+
+**Schritt 4: Training:**
+
+```bash
+cd training
+python train.py --config configs/default.yaml model.name=rssm
+```
+
+Die Logzeile `No telemetry CSVs in ... — loading N missions from
+cache-only artifact ...` bestätigt, dass aus dem Cache geladen wurde.
+
+##### Durchgetestetes Beispiel (FlyPaw-Referenzdaten)
+
+Verifiziert mit dem AERPAW/FlyPaw-Referenzdatensatz (`dataset/testing/flypaw/`,
+siehe unten) und `training/configs/flypaw_test.yaml`:
+
+1. Rohdaten → Telemetrie-CSVs (Maschine mit Zugriff auf die FlyPaw-Rohdaten):
+
+   ```bash
+   python3 data/flypaw_to_telemetry.py
+   # -> dataset/testing/flypaw/telemetry/mission_0000{1..7}_*.csv
+   ```
+
+2. Datenverarbeitung (nur Preprocessing, kein Training):
+
+   ```bash
+   cd training
+   python preprocess.py --config configs/default.yaml --experiment configs/flypaw_test.yaml
+   ```
+
+   Log nennt den Cache-Pfad, z.B.
+   `Cache directory: ../dataset/testing/flypaw/cache/1hz_7cda7ec3`.
+
+3. `.npy`-Artefakt liegt in:
+
+   ```
+   dataset/testing/flypaw/cache/1hz_7cda7ec3/
+       mission_00001.npy … mission_00007.npy
+       normalizer.json
+       splits.json
+   ```
+
+   Diesen kompletten Ordner (`1hz_7cda7ec3/`) hochladen — nicht nur einzelne `.npy`-Dateien.
+
+4. Upload zur FH-Cloud: ganzen Ordner `1hz_7cda7ec3/` hochladen.
+
+5. Download auf dem Trainingsrechner — Zielpfad muss exakt sein:
+
+   ```
+   <projekt-pfad>/dataset/testing/flypaw/cache/1hz_7cda7ec3/
+   ```
+
+   Also `<dataset_dir>/cache/<gleicher-hash-name>/`. `dataset/testing/flypaw/telemetry/`
+   (die Roh-CSVs) wird auf dem Trainingsrechner nicht benötigt.
+
+6. Training auf dem Trainingsrechner:
+
+   ```bash
+   cd training
+   python train.py --config configs/default.yaml --experiment configs/flypaw_test.yaml model.name=rssm
+   ```
+
+   Bestätigung im Log: `No telemetry CSVs in ... — loading 7 missions from cache-only artifact ...`
+
+Der Hash im Ordnernamen (`1hz_7cda7ec3`) hängt nur von `resample_freq_hz` und
+den aktivierten `features` ab — solange `default.yaml` + `flypaw_test.yaml`
+auf beiden Maschinen identisch sind, bleibt der Ordnername gleich.
+
 #### Modelle
 
 Alle Modelle implementieren die abstrakte `AnomalyDetectionModel`-Schnittstelle aus `models/base.py`:
@@ -384,6 +501,14 @@ python train.py model.name=rssm
 python train.py model.name=mts_jepa
 ```
 
+### Nur Datenverarbeitung (Cache für Cloud-Transfer)
+
+```bash
+cd training/
+python preprocess.py --config configs/default.yaml
+# Ergebnis: dataset/cache/<freq>hz_<hash>/ — siehe "Cache-Only Deploy" oben
+```
+
 ### Auswerten und exportieren
 
 ```bash
@@ -449,6 +574,7 @@ Docker + Docker Compose, mac80211_hwsim Kernel-Modul (für simuliertes WLAN), X1
 - [x] Orchestrator (automatisierte Datengenerierung)
 - [x] Angriffsskripte (5 PASTAD-Angriffskategorien)
 - [x] Datenpipeline (Preprocessing, Windowing, Normalisierung)
+- [x] Cache-Only Deploy (Datenverarbeitung/Training auf getrennten Maschinen, `preprocess.py` + Cloud-Transfer des `.npy`-Caches)
 - [x] RSSM-Modell (unsupervised, ONNX-exportierbar)
 - [x] MTS-JEPA-Modell (unsupervised, ONNX-exportierbar)
 - [x] Evaluation (unlabeled-Modus)
@@ -457,3 +583,8 @@ Docker + Docker Compose, mac80211_hwsim Kernel-Modul (für simuliertes WLAN), X1
 - [ ] HasslerBaseline-Architektur verifizieren (TODO im Code)
 - [ ] TensorRT-Pipeline auf Jetson Orin
 - [ ] Integration echter Angriffsdaten in Trainingsloop
+- [ ] Optuna für Hyperparameter-Tuning integrieren
+- [ ] optuna-dashboard installieren + nutzen zum Tracken des Tuning-Fortschritts
+- [ ] TensorBoard für Trainings-Tracking nutzen (`torch.utils.tensorboard`)
+- [ ] RSSM: Free-Nats-Clamp-Reihenfolge fixen (clamp pro Element vor mean(), nicht danach — `models/rssm/model.py`)
+- [ ] MTS-JEPA: eval_mask an konfigurierten mask_ratio koppeln statt hardcoded 50% (`models/mts_jepa/model.py`)
