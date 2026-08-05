@@ -96,3 +96,4 @@ logging:
   backend: "tensorboard"  # wandb | tensorboard | none
   project: "uav-ids-dronebridge"
   log_every_n_steps: 50
+  tensorboard_port: 6006

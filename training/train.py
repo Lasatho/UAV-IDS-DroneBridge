@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import socket
+import subprocess
 import time
 from pathlib import Path
 
@@ -34,6 +36,33 @@ logger = logging.getLogger("train")
 # ---------------------------------------------------------------------------
 # Logging backends (wandb optional)
 # ---------------------------------------------------------------------------
+
+def _port_is_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("localhost", port)) == 0
+
+
+def _launch_tensorboard(logdir: str, port: int) -> None:
+    """Best-effort background TensorBoard server; skips if one already serves the port."""
+    if _port_is_open(port):
+        logger.info("TensorBoard already running at http://localhost:%d", port)
+        return
+    try:
+        subprocess.Popen(
+            ["tensorboard", "--logdir", logdir, "--port", str(port)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        logger.info(
+            "TensorBoard started: http://localhost:%d  (logdir=%s)", port, logdir
+        )
+    except FileNotFoundError:
+        logger.warning(
+            "tensorboard CLI not found on PATH — install via "
+            "`pip install tensorboard` or start manually: "
+            "tensorboard --logdir %s", logdir,
+        )
+
 
 class MetricLogger:
     """Thin wrapper: wandb or tensorboard if configured+available, else stdout only."""
@@ -55,6 +84,10 @@ class MetricLogger:
             try:
                 from torch.utils.tensorboard import SummaryWriter
                 self.writer = SummaryWriter(log_dir=str(log_dir))
+                _launch_tensorboard(
+                    cfg["training"]["checkpoint_dir"],
+                    int(cfg["logging"].get("tensorboard_port", 6006)),
+                )
             except Exception as e:  # not installed
                 logger.warning("tensorboard unavailable (%s) — stdout only", e)
                 self.backend = "none"
