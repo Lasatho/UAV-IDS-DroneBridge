@@ -8,6 +8,10 @@ pyyaml>=6.0
 wandb>=0.16
 tensorboard>=2.15  # only needed if logging.backend == "tensorboard"
 
+# Hyperparameter tuning (tune.py)
+optuna>=3.5
+optuna-dashboard>=0.15  # web UI: optuna-dashboard sqlite:///optuna_studies/<model>.db
+
 # Export (install when needed, not required for training)
 # onnx>=1.15
 # onnxruntime>=1.17
