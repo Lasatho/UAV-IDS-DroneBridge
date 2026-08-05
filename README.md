@@ -411,9 +411,14 @@ Joint Embedding Predictive Architecture für multivariate Zeitreihen.
 - EMA-Target-Branch (kein Kollaps-Problem)
 - Anomalie-Score = mittlerer Embedding-Prediction-Error auf gemaskten Patches
 
-**HasslerBaseline** (`models/hassler/`) — Supervised, noch nicht vollständig:
-CNN-LSTM nach Hassler, Mughal & Ismail (IEEE TITS 2024). Braucht Angriffsbezeichnungen pro Fenster.
-Architektur ist aktuell ein Platzhalter — muss gegen das Paper verifiziert werden (TODO).
+**HasslerBaseline** (`models/hassler/`) — Supervised, **Stretch Goal, nicht kritischer Pfad**:
+CNN-LSTM nach Hassler, Mughal & Ismail (IEEE TITS 2024). Architektur aktuell Platzhalter, noch nicht gegen Paper verifiziert (TODO).
+
+Bewusst niedriger priorisiert als RSSM/MTS-JEPA, aus zwei Gründen:
+- **Größerer Datenbedarf:** `requires_labels=True` — braucht gelabelte Angriffsfenster schon im *Training* (klassenbalanciert), nicht nur in der Evaluation wie bei RSSM/JEPA (die nur Normal-Flugdaten zum Trainieren brauchen, Angriffsdaten nur für Schwellwert-Kalibrierung). Hängt damit zusätzlich an einer ausgereiften, klassenbalancierten Angriffs-Simulation — `train.py` verweigert Supervised-Modelle aktuell explizit (`NotImplementedError`), bis WP1-WP4 (Angreifer-Integration) steht.
+- **Feature-Fidelity ungeklärt:** ob Hasslers Paper-Feature-Engineering aus unseren MAVLink/DroneBridge-Rohdaten überhaupt reproduzierbar ist, ist offen (siehe TODO-Kommentar in `models/hassler/model.py`). Deswegen kein Anspruch auf exakte Reproduktion ihrer Zahlen — falls das Modell doch trainiert wird, läuft es auf unserem eigenen 37-Feature-Set (identisch zu RSSM/JEPA-Input) und wird im Text als "CNN-LSTM im Stil von Hassler et al." bezeichnet, nicht als Reproduktion. Paper-Zahlen dienen nur als Kontext-Vergleich, nicht als Zielgröße.
+
+Fokus liegt auf RSSM/MTS-JEPA-Ergebnissen mit echten SITL-Daten; Hassler wird nur nachgezogen, falls am Ende Zeit + eine ausreichend reife Angriffslabel-Pipeline vorhanden sind.
 
 #### Training
 
@@ -429,6 +434,8 @@ Checkpoints landen in `checkpoints/{timestamp}_{model}/`:
 - `epoch_XXXX.pt` — periodische Snapshots (alle 10 Epochs)
 - `config.json` — vollständige Konfiguration für Reproduzierbarkeit
 
+**Trainings-Tracking:** `logging.backend` steuert das Metrik-Backend (`tensorboard` | `wandb` | `none`), Default `tensorboard`. `train.py` startet den TensorBoard-Server bei `backend=tensorboard` automatisch im Hintergrund (`--logdir <checkpoint_dir>`, Port `logging.tensorboard_port`, Default `6006`) — kein separater manueller Start nötig. Prüft vorher, ob der Port schon belegt ist (z.B. von einem vorherigen Run), und startet dann keinen zweiten Server. Läuft im `--logdir` über den gesamten `checkpoint_dir`, nicht nur den aktuellen Run — mehrere Runs (verschiedene Modelle/Configs) landen so gemeinsam im selben Dashboard. Aufrufbar im Browser unter `http://localhost:6006` (bei Remote-Zugriff z.B. per SSH-Portforwarding oder Remote-Desktop-Session).
+
 #### Evaluation
 
 ```bash
@@ -437,7 +444,7 @@ python evaluate.py --checkpoint checkpoints/<run>/best.pt
 
 Zwei Modi (automatisch erkannt):
 
-- **Unlabeled** (aktuell): Keine Angriffsdaten vorhanden. Berechnet Anomalie-Score-Verteilung auf Normal-Daten, kalibriert Schwellwerte (Perzentile: p90/p95/p99/p99.5/p99.9). Der p99-Schwellwert entspricht ~1% FPR auf Normaldaten.
+- **Unlabeled** (aktuell): Keine Angriffsdaten vorhanden. Berechnet Anomalie-Score-Verteilung auf dem gewählten Split (`--split`, Default `test`). Schwellwerte (Perzentile: p90/p95/p99/p99.5/p99.9) werden auf einem **disjunkten** Split kalibriert (Val, oder Train falls `--split val` gewählt wird), nicht auf dem bewerteten Split selbst — sonst wäre der Schwellwert auf genau die Daten zugeschnitten, an denen er später gemessen wird. Sobald Angriffslabels vorhanden sind, werden dabei nur Normal-Fenster für die Kalibrierung verwendet, damit der p99-Schwellwert weiterhin ~1% FPR auf Normaldaten bedeutet (siehe `evaluate.py:calibrate_thresholds`).
 - **Labeled** (nach Angriffsdaten-Integration): Vollständige Metriken: Precision, Recall, F1, AUC-ROC, AUC-PR, FPR, Detection Latency.
 
 Ausgabe: `scores_test.npz` + `eval_report_test.json` neben dem Checkpoint.
@@ -463,7 +470,7 @@ trtexec --onnx=model.onnx --saveEngine=model_int8.engine --int8 --calib=<cache>
 
 #### Hyperparameter-Suche (`tune.py`)
 
-Optuna-Suche pro Modell (`rssm` | `mts_jepa`), gemeinsamer Suchraum aus Shared- und Architektur-Hyperparametern (nicht gestaged) — Details und Begründung der fixierten Parameter im Docstring von `tune.py`.
+Optuna-Suche pro Modell (`rssm` | `mts_jepa`). **Gemeinsamer Suchraum** aus Shared- und Architektur-Hyperparametern — bewusst *nicht* gestaged (erst Shared, dann Modellspezifisches nacheinander tunen wäre Greedy/Coordinate-Descent und würde Interaktionen zwischen Parametern verfehlen, z.B. hängt die optimale `lr` von der Modellkapazität ab).
 
 ```bash
 cd training
@@ -476,7 +483,21 @@ Ergebnisse landen als SQLite-Study unter `optuna_studies/<model>.db`, ansehbar v
 optuna-dashboard sqlite:///optuna_studies/rssm.db
 ```
 
-Ziel-Metrik aktuell Val-Loss (Proxy, kein direktes Anomalie-Erkennungsmaß) mit Median-Pruning schwacher Trials; wird auf AUC-PR umgestellt, sobald gelabelte Angriffsfenster verfügbar sind.
+**Ziel-Metrik:** aktuell Val-Loss (mit Median-Pruning schwacher Trials) — einzige ohne Angriffslabels verfügbare Metrik, aber nur ein **Proxy**: niedrigerer Val-Loss heißt nicht automatisch bessere Anomalie-Trennschärfe (ein zu flexibles Modell kann auch Angriffsmuster gut rekonstruieren). Sobald gelabelte Angriffsfenster verfügbar sind, auf **AUC-PR** umstellen (nicht AUC-ROC — bei seltener Angriffsklasse verzerrt ROC optimistisch unter Klassenungleichgewicht) — schwellwertunabhängig, damit Threshold und Hyperparameter nicht in derselben Suche gegenseitig verwaschen.
+
+**Getunt** (`SEARCH_SPACES` in `tune.py`), gemeinsam pro Modell-Study:
+- Beide Modelle: `lr` (log-uniform 1e-4–1e-2), `weight_decay` (log-uniform 1e-6–1e-3)
+- RSSM: `hidden_dim`, `deterministic_dim`, `kl_dyn_beta`, `free_nats`
+- MTS-JEPA: `embed_dim`, `depth`, `predictor_depth`, `mask_ratio`, `patch_length`
+
+**Fixiert** (bei `configs/default.yaml`-Wert), mit Begründung:
+- `stochastic_dim` (RSSM), `kl_rep_beta` (RSSM) — Dynamics-Term (`kl_dyn_beta`) ist in DreamerV3-artigen Modellen literaturbekannt der sensiblere KL-Balancing-Term, Rep-Term meist robust über weiten Wertebereich
+- `num_heads` (JEPA) — an `embed_dim`-Teilbarkeit gekoppelt, Constraint-Sampling für geringen erwarteten Zugewinn nicht lohnend
+- `ema_decay` (JEPA) — in JEPA-Literatur meist robust über weiten Wertebereich
+- `data.batch_size`, `data.window_length`/`window_stride` — bewusste Daten-Design-Entscheidung (Fensterlänge = "wie lang ist ein Angriff", keine reine Modellkapazitätsfrage), zusätzlich an `patch_length`-Teilbarkeit gekoppelt — Vermischung von Daten- und Modell-Suchraum vermieden
+- `training.scheduler` (cosine), `warmup_epochs`, `grad_clip_norm` — Standardwerte, geringer erwarteter Grenznutzen ggü. Suchraum-Kosten (jede zusätzliche Dimension braucht bei TPE mehr Trials für verlässliche Konvergenz)
+
+Damit bleibt jede Study bei 6 Dimensionen, mit TPE bei überschaubarem Trial-Budget (50–100) gut sampelbar. `data.resample_freq_hz`/`data.features` bewusst nicht im Suchraum — die bestimmen den `.npy`-Cache-Hash, jeder Trial würde sonst Preprocessing neu anstoßen.
 
 #### CLI-Referenz (`training/`)
 
