@@ -461,6 +461,35 @@ trtexec --onnx=model.onnx --saveEngine=model_fp16.engine --fp16
 trtexec --onnx=model.onnx --saveEngine=model_int8.engine --int8 --calib=<cache>
 ```
 
+#### Hyperparameter-Suche (`tune.py`)
+
+Optuna-Suche pro Modell (`rssm` | `mts_jepa`), gemeinsamer Suchraum aus Shared- und Architektur-Hyperparametern (nicht gestaged) — Details und Begründung der fixierten Parameter im Docstring von `tune.py`.
+
+```bash
+cd training
+python tune.py --model rssm     --n-trials 50 --epochs 30
+python tune.py --model mts_jepa --n-trials 50 --epochs 30
+```
+
+Ergebnisse landen als SQLite-Study unter `optuna_studies/<model>.db`, ansehbar via:
+```bash
+optuna-dashboard sqlite:///optuna_studies/rssm.db
+```
+
+Ziel-Metrik aktuell Val-Loss (Proxy, kein direktes Anomalie-Erkennungsmaß) mit Median-Pruning schwacher Trials; wird auf AUC-PR umgestellt, sobald gelabelte Angriffsfenster verfügbar sind.
+
+#### CLI-Referenz (`training/`)
+
+`preprocess.py` und `train.py` akzeptieren zusätzlich freie `key.path=value`-Overrides als Positionalargumente (höchste Priorität, nach `--config`/`--experiment`); `tune.py` nur `--config`/`--experiment` ohne freie Overrides; `evaluate.py`/`export.py` haben keine Config-Flags — sie laden Config und Datensplit direkt aus dem Checkpoint.
+
+| Skript | Pflicht-Flags | Optionale Flags | Zweck |
+|---|---|---|---|
+| `preprocess.py` | — | `--config` (default `configs/default.yaml`), `--experiment`, `overrides...` | Nur Cache-Erzeugung, kein Training |
+| `train.py` | — | `--config`, `--experiment`, `overrides...` (z.B. `model.name=rssm`, `training.lr=3e-4`, `logging.backend=tensorboard`, `logging.tensorboard_port=6007`) | Training + Checkpointing |
+| `evaluate.py` | `--checkpoint` | `--split` (`val`\|`test`, default `test`), `--batch-size` (default `256`) | Score-Verteilung / Metriken auf Checkpoint |
+| `export.py` | `--checkpoint` | `--output` (default: neben Checkpoint), `--opset` (default `18`), `--export-calibration N` (INT8-Kalibrierungsdaten) | ONNX-Export |
+| `tune.py` | `--model` (`rssm`\|`mts_jepa`) | `--config`, `--experiment`, `--n-trials` (default `50`), `--epochs` (default `30`, pro Trial), `--storage-dir` (default `optuna_studies`) | Optuna-Hyperparametersuche |
+
 ---
 
 ## Schnellstart
@@ -583,8 +612,9 @@ Docker + Docker Compose, mac80211_hwsim Kernel-Modul (für simuliertes WLAN), X1
 - [ ] HasslerBaseline-Architektur verifizieren (TODO im Code)
 - [ ] TensorRT-Pipeline auf Jetson Orin
 - [ ] Integration echter Angriffsdaten in Trainingsloop
-- [ ] Optuna für Hyperparameter-Tuning integrieren
-- [ ] optuna-dashboard installieren + nutzen zum Tracken des Tuning-Fortschritts
-- [ ] TensorBoard für Trainings-Tracking nutzen (`torch.utils.tensorboard`)
-- [ ] RSSM: Free-Nats-Clamp-Reihenfolge fixen (clamp pro Element vor mean(), nicht danach — `models/rssm/model.py`)
-- [ ] MTS-JEPA: eval_mask an konfigurierten mask_ratio koppeln statt hardcoded 50% (`models/mts_jepa/model.py`)
+- [x] Optuna für Hyperparameter-Tuning integrieren (`tune.py`, siehe CLI-Referenz oben)
+- [x] optuna-dashboard installieren + nutzen zum Tracken des Tuning-Fortschritts
+- [x] TensorBoard für Trainings-Tracking nutzen (`torch.utils.tensorboard`, Default-Backend, Auto-Start aus `train.py`)
+- [x] RSSM: Free-Nats-Clamp-Reihenfolge fixen (clamp pro Element vor mean(), nicht danach — `models/rssm/model.py`)
+- [x] MTS-JEPA: eval_mask an konfigurierten mask_ratio koppeln statt hardcoded 50% (`models/mts_jepa/model.py`)
+- [x] Evaluate: Threshold-Kalibrierung von Bewertungssplit entkoppelt (Val statt Test, nur Normal-Fenster — `evaluate.py`)

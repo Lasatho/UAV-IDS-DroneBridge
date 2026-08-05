@@ -81,6 +81,8 @@ class MTSJEPA(AnomalyDetectionModel):
         super().__init__(num_features, window_length)
         assert window_length % patch_length == 0, \
             "window_length must be divisible by patch_length"
+        assert embed_dim % 2 == 0, \
+            "embed_dim must be even (sin/cos positional encoding splits it in half)"
         self.patch_length = patch_length
         self.num_patches = window_length // patch_length
         self.mask_ratio = mask_ratio
@@ -105,9 +107,12 @@ class MTSJEPA(AnomalyDetectionModel):
         self.target_encoder = _TransformerEncoder(embed_dim, depth, num_heads)
         self._init_target()
 
-        # Deterministic eval mask: every other patch (fixed pattern)
+        # Deterministic eval mask: n_masked patches spread evenly over the
+        # window (generalizes the fixed "every other patch" pattern to the
+        # configured mask_ratio, instead of hard-coding 50%).
         eval_mask = torch.zeros(self.num_patches, dtype=torch.bool)
-        eval_mask[::2] = True
+        eval_idx = (torch.arange(self.n_masked) * self.num_patches) // self.n_masked
+        eval_mask[eval_idx] = True
         self.register_buffer("eval_mask", eval_mask)
 
     # ------------------------------------------------------------------

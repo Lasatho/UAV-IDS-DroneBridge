@@ -167,10 +167,13 @@ class RSSM(AnomalyDetectionModel):
     def training_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
         out = self._rollout(batch, use_posterior=True)
         recon_loss = F.mse_loss(out["recon_post"], batch)
-        # Free nats applied per term (clamp keeps gradient at zero only
-        # below the threshold of the respective term).
-        kl_dyn = torch.clamp(out["kl_dyn"].mean(), min=self.free_nats)
-        kl_rep = torch.clamp(out["kl_rep"].mean(), min=self.free_nats)
+        # Free nats applied per element, before averaging: each (batch,
+        # timestep) KL value is floored at free_nats individually, so
+        # elements already above the threshold keep their own gradient
+        # instead of being averaged together with below-threshold ones
+        # and zeroed out as a whole once the batch mean dips below it.
+        kl_dyn = torch.clamp(out["kl_dyn"], min=self.free_nats).mean()
+        kl_rep = torch.clamp(out["kl_rep"], min=self.free_nats).mean()
         loss = recon_loss + self.kl_dyn_beta * kl_dyn + self.kl_rep_beta * kl_rep
         return {
             "loss": loss,

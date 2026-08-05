@@ -6,14 +6,21 @@ Evaluation entry point.
 Two modes, selected automatically:
 
 1. **Unlabeled (current state)** — no attack windows exist yet. Computes
-   anomaly scores on the normal test split, reports the score
-   distribution, and calibrates candidate thresholds (percentiles of
-   normal scores). The resulting threshold corresponds directly to an
-   expected FPR on normal data (e.g. 99th percentile ≈ 1% FPR).
+   anomaly scores on the requested split (--split, default test) and
+   reports the score distribution.
 
 2. **Labeled (after WP1-WP4)** — window labels available. Computes the
    full metric set: precision, recall, F1, AUC-ROC, AUC-PR, FPR at the
    calibrated threshold, and detection latency.
+
+In both modes, candidate thresholds (percentiles) are calibrated on a
+split disjoint from the one being evaluated (val, or train if --split
+val is requested) and restricted to normal windows if labels are
+available — see calibrate_thresholds(). This keeps the threshold from
+being tuned on the same data its metrics are reported on, and keeps
+"p99" meaning ~1% FPR on normal operation rather than being skewed by
+attack scores in the calibration set. The resulting p99 threshold
+corresponds directly to an expected FPR on normal data (~1%).
 
 Label integration (attack data) requires mapping phase_labels timestamps
 (epoch seconds) onto telemetry timestamps; see `load_window_labels`.
@@ -151,6 +158,27 @@ def load_window_labels(dataset, phase_labels_dir: Path) -> np.ndarray | None:
 # Main
 # ---------------------------------------------------------------------------
 
+def calibrate_thresholds(
+    model, calib_dataset, batch_size: int, device, phase_labels_dir: Path,
+) -> dict[str, float]:
+    """Percentile thresholds from a calibration split, normal windows only.
+
+    Two properties, both required: (1) calib_dataset must be disjoint from
+    the split whose metrics get reported (else the threshold is tuned on
+    the same windows it's later judged against — leakage); (2) if the
+    calibration split contains attack windows, they are excluded so "p99"
+    keeps meaning ~1% FPR on normal operation instead of being pulled
+    upward by attack scores (a different failure mode than leakage —
+    would happen even on a fully disjoint split).
+    """
+    scores, _, _ = compute_scores(model, calib_dataset, batch_size, device)
+    labels = load_window_labels(calib_dataset, phase_labels_dir)
+    if labels is not None:
+        scores = scores[labels == 0]
+    percentiles = [90.0, 95.0, 99.0, 99.5, 99.9]
+    return {f"p{p:g}": float(np.percentile(scores, p)) for p in percentiles}
+
+
 @torch.no_grad()
 def compute_scores(
     model, dataset, batch_size: int, device
@@ -211,9 +239,16 @@ def main() -> None:
     )
     logger.info("%d windows scored on '%s' split", len(scores), args.split)
 
-    # Threshold calibration on normal-score percentiles.
-    percentiles = [90.0, 95.0, 99.0, 99.5, 99.9]
-    thresholds = {f"p{p:g}": float(np.percentile(scores, p)) for p in percentiles}
+    phase_labels_dir = Path(cfg["data"]["dataset_dir"]) / "phase_labels"
+
+    # Threshold calibration on a split disjoint from the one being
+    # evaluated (see calibrate_thresholds docstring for why).
+    calib_split = "val" if args.split != "val" else "train"
+    logger.info("Calibrating thresholds on '%s' split (disjoint from '%s')",
+                calib_split, args.split)
+    thresholds = calibrate_thresholds(
+        model, datasets[calib_split], args.batch_size, device, phase_labels_dir
+    )
 
     report: dict = {
         "checkpoint": str(ckpt_path),
@@ -226,9 +261,9 @@ def main() -> None:
             "median": float(np.median(scores)),
         },
         "calibrated_thresholds": thresholds,
+        "threshold_calibration_split": calib_split,
     }
 
-    phase_labels_dir = Path(cfg["data"]["dataset_dir"]) / "phase_labels"
     labels = load_window_labels(dataset, phase_labels_dir)
 
     if labels is None:
