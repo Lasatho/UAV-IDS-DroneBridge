@@ -45,6 +45,3 @@ training:
   epochs: 20
   early_stopping_patience: 20
   checkpoint_dir: "./checkpoints_flypaw_test"
-
-logging:
-  backend: "none"

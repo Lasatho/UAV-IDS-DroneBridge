@@ -36,11 +36,12 @@ logger = logging.getLogger("train")
 # ---------------------------------------------------------------------------
 
 class MetricLogger:
-    """Thin wrapper: wandb if configured+available, else stdout only."""
+    """Thin wrapper: wandb or tensorboard if configured+available, else stdout only."""
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, log_dir: Path | None = None):
         self.backend = cfg["logging"]["backend"]
         self.run = None
+        self.writer = None
         if self.backend == "wandb":
             try:
                 import wandb
@@ -50,14 +51,26 @@ class MetricLogger:
             except Exception as e:  # offline, no login, not installed
                 logger.warning("wandb unavailable (%s) — stdout only", e)
                 self.backend = "none"
+        elif self.backend == "tensorboard":
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                self.writer = SummaryWriter(log_dir=str(log_dir))
+            except Exception as e:  # not installed
+                logger.warning("tensorboard unavailable (%s) — stdout only", e)
+                self.backend = "none"
 
     def log(self, metrics: dict, step: int) -> None:
         if self.run is not None:
             self.run.log(metrics, step=step)
+        elif self.writer is not None:
+            for k, v in metrics.items():
+                self.writer.add_scalar(k, v, step)
 
     def finish(self) -> None:
         if self.run is not None:
             self.run.finish()
+        if self.writer is not None:
+            self.writer.close()
 
 
 # ---------------------------------------------------------------------------
@@ -151,13 +164,14 @@ def main() -> None:
 
     tcfg = cfg["training"]
     optimizer, scheduler = model.configure_optimizers(tcfg)
-    mlog = MetricLogger(cfg)
 
     # --- Checkpointing ---
     run_id = time.strftime("%Y%m%d_%H%M%S") + f"_{name}"
     ckpt_dir = Path(tcfg["checkpoint_dir"]) / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     (ckpt_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+
+    mlog = MetricLogger(cfg, log_dir=ckpt_dir)
 
     def save(tag: str, epoch: int, val_loss: float) -> None:
         torch.save(
