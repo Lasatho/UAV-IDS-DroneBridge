@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
        > /etc/apt/sources.list.d/gazebo-stable.list \
     && apt-get update && apt-get install -y \
        gz-tools2 \
-       gz-transport13 \
+       gz-transport13-cli \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /opt/orchestrator/requirements.txt
