@@ -26,14 +26,11 @@ sleep 1
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "${USE_WMEDIUMD:-0}" = "1" ]; then
     if command -v wmediumd >/dev/null 2>&1; then
-        echo "[*] Starting wmediumd (USE_WMEDIUMD=1)..."
-        sudo wmediumd -c "${SCRIPT_DIR}/wmediumd/wmediumd.cfg" >/tmp/wmediumd.log 2>&1 &
-        sleep 2
-        if pgrep -f wmediumd >/dev/null; then
-            echo "    wmediumd running (log: /tmp/wmediumd.log)"
-        else
-            echo "    WARNING: wmediumd failed to start — see /tmp/wmediumd.log"
-        fi
+        # Launched in the background: it waits for the link to come up (so it
+        # does not hit the startup race that kills wmediumd with EINVAL) and
+        # then starts wmediumd for the rest of the session.
+        echo "[*] wmediumd will start once the link is up (USE_WMEDIUMD=1, log /tmp/wmediumd.log)"
+        sudo "${SCRIPT_DIR}/wmediumd/start_wmediumd.sh" >/tmp/wmediumd.log 2>&1 &
     else
         echo "[!] USE_WMEDIUMD=1 but wmediumd not installed."
         echo "    Build it once: simulation/wmediumd/setup_wmediumd.sh"
