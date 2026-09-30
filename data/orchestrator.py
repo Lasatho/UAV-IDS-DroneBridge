@@ -245,9 +245,33 @@ class Orchestrator:
         # return timeout
 
     def configure_wind(self, wind_params: dict, wind_direction_deg: int):
-        """Placeholder: configure Gazebo wind plugin for this mission."""
-        # TODO: Implement via gz service call or SDF patching for next simulation 
-        log.info(f"  Wind: {wind_params}, direction={wind_direction_deg}°")
+        """Set the Gazebo wind for this mission via the WindEffects topic.
+
+        Publishes the mean wind velocity to /world/iris_runway/wind. Gust
+        turbulence is fixed in the world SDF (the Wind message only carries
+        the mean vector). World frame is ENU (x=East, y=North, z=Up); the
+        wind_direction_deg is the azimuth the wind blows *from* (0=N, 90=E),
+        so the air velocity points toward direction+180.
+        """
+        speed = (wind_params.get("speed_min", 0.0)
+                 + wind_params.get("speed_max", 0.0)) / 2.0
+        theta = math.radians(wind_direction_deg)
+        vx = -speed * math.sin(theta)   # East component
+        vy = -speed * math.cos(theta)   # North component
+        vz = 0.0
+        msg = (f"linear_velocity: {{x: {vx:.4f}, y: {vy:.4f}, z: {vz:.4f}}}, "
+               f"enable_wind: true")
+        try:
+            subprocess.run(
+                ["gz", "topic", "-t", "/world/iris_runway/wind",
+                 "-m", "gz.msgs.Wind", "-p", msg],
+                timeout=5, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            log.info(f"  Wind: {speed:.1f} m/s from {wind_direction_deg}° "
+                     f"(v_ENU=({vx:.2f}, {vy:.2f}, {vz:.2f}))")
+        except Exception as e:
+            log.warning(f"  Wind config failed ({e}) — flying without wind")
 
     def update_manifest_status(self, mission_id: str, new_status: str):
         """Update status column for mission_id in manifest CSV."""

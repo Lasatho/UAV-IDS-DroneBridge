@@ -36,4 +36,11 @@ RUN apt-get update && apt-get install -y \
     && cp -r /opt/ardupilot_gazebo_src/worlds /opt/ardupilot_gazebo/worlds \
     && rm -rf /var/lib/apt/lists/*
 
-CMD ["gz", "sim", "-s", "-r", "/opt/ardupilot_gazebo/worlds/iris_runway.sdf"]
+# Wind: enable aerodynamic wind forcing on the iris fuselage and ship the
+# custom world carrying the WindEffects plugin. The base_link needs the
+# <enable_wind> flag for WindEffects to apply force to it.
+RUN sed -i "/<link name='base_link'>/a\\      <enable_wind>true</enable_wind>" \
+    /opt/ardupilot_gazebo/models/iris_with_standoffs/model.sdf
+COPY worlds/iris_runway_wind.sdf /opt/ardupilot_gazebo/worlds/iris_runway_wind.sdf
+
+CMD ["gz", "sim", "-s", "-r", "/opt/ardupilot_gazebo/worlds/iris_runway_wind.sdf"]
