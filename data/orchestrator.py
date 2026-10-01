@@ -74,10 +74,34 @@ class Orchestrator:
         (output_dir / "telemetry").mkdir(parents=True, exist_ok=True)
         (output_dir / "phase_labels").mkdir(parents=True, exist_ok=True)
 
+    def _bind_vehicle_heartbeat(self, timeout=60):
+        """Bind the connection target to the real ArduPilot vehicle.
+
+        MAVProxy emits a phantom HEARTBEAT with system id 0; a plain
+        wait_heartbeat() may latch onto that, leaving target_system=0 so
+        every PARAM_SET / takeoff command is sent into the void and the
+        mission silently fails at takeoff. Skip sysid 0 and match the
+        quadrotor autopilot explicitly.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.conn.recv_match(type="HEARTBEAT", blocking=True,
+                                       timeout=5.0)
+            if msg is None:
+                continue
+            src = msg.get_srcSystem()
+            if src == 0 or msg.type != mavutil.mavlink.MAV_TYPE_QUADROTOR:
+                continue
+            self.conn.target_system = src
+            self.conn.target_component = msg.get_srcComponent()
+            return True
+        return False
+
     def connect(self):
         log.info(f"[+] Connecting to {self.connection}...")
         self.conn = mavutil.mavlink_connection(self.connection)
-        self.conn.wait_heartbeat()
+        if not self._bind_vehicle_heartbeat():
+            raise RuntimeError("No vehicle heartbeat (only phantom sysid 0?)")
         log.info(f"Heartbeat from system {self.conn.target_system}:"
                  f"{self.conn.target_component}")
 
@@ -549,8 +573,11 @@ class Orchestrator:
         )
         time.sleep(20)
         self.conn = mavutil.mavlink_connection(self.connection)
-        self.conn.wait_heartbeat()
-        log.info("[+] SITL rebooted, heartbeat OK.")
+        if not self._bind_vehicle_heartbeat():
+            log.warning("[?] Only phantom heartbeat after reboot — retrying bind")
+            self._bind_vehicle_heartbeat()
+        log.info(f"[+] SITL rebooted, heartbeat OK "
+                 f"(sys {self.conn.target_system}:{self.conn.target_component}).")
 
     def verify_armed(self, timeout=10):
         """Check heartbeat to verify armed state."""
