@@ -587,9 +587,6 @@ class Orchestrator:
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
-        # Configure wind
-        self.configure_wind(meta["wind_params"], meta["wind_direction_deg"])
-
         # Start capture
         tcpdump_proc = self.start_tcpdump(mission_id)
         telemetry_proc = self.start_telemetry_logger(mission_id)
@@ -622,6 +619,16 @@ class Orchestrator:
             if not self.verify_flying():
                 raise RuntimeError("Takeoff failed")
             airborne = True
+
+            # Apply wind only after a successful takeoff. Applying it before
+            # (at mission start) made the vehicle fight the wind during the
+            # vertical GUIDED climb, which the more aggressive drone presets
+            # could not complete under moderate/gusty wind -> "Takeoff failed".
+            # Wind is still active for the whole waypoint mission and the
+            # attack window (attacks fire mid-flight), only the ~12 s takeoff
+            # is calm.
+            self.configure_wind(meta["wind_params"], meta["wind_direction_deg"])
+
             # Now switch to AUTO — mission continues from WP2
             self.set_mode("AUTO")
 
