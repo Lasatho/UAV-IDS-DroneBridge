@@ -639,8 +639,12 @@ class Orchestrator:
                 if isinstance(seed, str):
                     seed = int(seed, 16)
                 rng = random.Random(seed) if seed is not None else random
-                attack_start_offset = rng.uniform(60, 180)
-                attack_duration = rng.uniform(15, 60)
+                # Offset/duration kept short so the attack reliably fires within
+                # even the shortest missions (a rectangle flies ~120s after the
+                # first WP); offset+duration <= 85s leaves a normal window before
+                # (min 60s flight is enforced) and after the attack.
+                attack_start_offset = rng.uniform(15, 45)
+                attack_duration = rng.uniform(15, 40)
                 log.info(f"  Attack scheduled: {attack_type}, "
                          f"offset={attack_start_offset:.0f}s, "
                          f"duration={attack_duration:.0f}s "
