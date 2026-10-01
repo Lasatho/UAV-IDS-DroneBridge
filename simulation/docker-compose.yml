@@ -94,6 +94,12 @@ services:
     # interface); matches the rest of the stack and the verified attack tests.
     privileged: true
     network_mode: host
+    # Manifest is selectable so the same stack runs the normal or the attack
+    # dataset: MANIFEST=missions_manifest_attacks.csv ./start_sim.sh
+    command: >
+      python3 orchestrator.py
+      --manifest /data/${MANIFEST:-missions_manifest.csv}
+      --output /data
     volumes:
       - ${REPO_ROOT}/dataset:/data
     depends_on:
