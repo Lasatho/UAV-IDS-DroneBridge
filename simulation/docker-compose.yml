@@ -90,6 +90,9 @@ services:
     environment:
       - NTFY_TOPIC=uav-ids-lasse
     container_name: uav_ids_orchestrator
+    # privileged for raw-socket RF attacks (Scapy sendp on the wlan2 monitor
+    # interface); matches the rest of the stack and the verified attack tests.
+    privileged: true
     network_mode: host
     volumes:
       - ${REPO_ROOT}/dataset:/data

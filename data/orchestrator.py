@@ -201,7 +201,10 @@ class Orchestrator:
             log.warning(f"  Mission upload issue: {ack}")
 
     def estimate_mission_timeout(self, wp_path: Path, meta: dict) -> int:
-        """Fuck this. Fixed 30 minute timeout for all missions."""
+        """Fixed timeout: 10 min for attack runs (failsafe/hold is the
+        expected attack effect), 30 min for normal missions."""
+        if meta.get("attack_type", "none") != "none":
+            return 600
         return 1800
         # """Estimate max mission duration from actualy waypoint distances"""
         # wps = []
@@ -594,6 +597,7 @@ class Orchestrator:
 
         start_time = time.time()
         success = False
+        airborne = False
         reached_wps = set()
 
         atk_start = None
@@ -617,6 +621,7 @@ class Orchestrator:
             self.takeoff(15)
             if not self.verify_flying():
                 raise RuntimeError("Takeoff failed")
+            airborne = True
             # Now switch to AUTO — mission continues from WP2
             self.set_mode("AUTO")
 
@@ -626,12 +631,20 @@ class Orchestrator:
             attack_duration = None
 
             if attack_type != "none":
-                # Randomized: start 60-180s after first WP, duration 15-60s
-                attack_start_offset = random.uniform(60, 180)
-                attack_duration = random.uniform(15, 60)
+                # Deterministic schedule from per-mission attack_seed (meta):
+                # start 60-180s after first WP, duration 15-60s. Falls back to
+                # the global RNG if no seed is present. Seed may be an int or a
+                # hex string.
+                seed = meta.get("attack_seed")
+                if isinstance(seed, str):
+                    seed = int(seed, 16)
+                rng = random.Random(seed) if seed is not None else random
+                attack_start_offset = rng.uniform(60, 180)
+                attack_duration = rng.uniform(15, 60)
                 log.info(f"  Attack scheduled: {attack_type}, "
                          f"offset={attack_start_offset:.0f}s, "
-                         f"duration={attack_duration:.0f}s")
+                         f"duration={attack_duration:.0f}s "
+                         f"(seed={seed})")
 
             mission_timeout = self.estimate_mission_timeout(wp_path, meta)
             success, reached_wps, atk_start, atk_end = self.wait_mission_complete(
@@ -658,11 +671,22 @@ class Orchestrator:
                              attack_end=atk_end,
                              waypoints_reached=list(reached_wps),
                              mission_success=success)
-            status = "completed" if success else "failed"
+            # For attack runs a flight that got airborne and actually fired the
+            # attack is valid data even if it never completed cleanly — the
+            # failsafe/hold/termination is the attack effect, not a sim failure.
+            # Only genuine pre-flight errors (arming/takeoff/GPS) count as
+            # failures and toward the consecutive-failure stop.
+            run_attack_type = meta.get("attack_type", "none")
+            if run_attack_type != "none":
+                run_valid = airborne and atk_start is not None
+            else:
+                run_valid = success
+
+            status = "completed" if run_valid else "failed"
             self.update_manifest_status(mission_id, status)
             log.info(f"=== {mission_id} {status} ({end_time - start_time:.1f}s) ===")
 
-            if success:
+            if run_valid:
                 self.consecutive_failures = 0
             else:
                 self.consecutive_failures += 1
