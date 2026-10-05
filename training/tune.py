@@ -8,9 +8,8 @@ training loss. The training loss is unsuitable here because tuned
 hyperparameters change its formula (RSSM: kl_dyn_beta/free_nats set a hard
 lower bound) or its scale (MTS-JEPA: MSE over L2-normalized embeddings
 scales with 1/embed_dim). MTS-JEPA scores are converted to 1 - cos so they
-are independent of embed_dim. Still a proxy for detection quality (stage 1
-of the two-stage procedure in docs/training_runs_4hz.md, section 5); stage 2
-ranks the best configurations by AUC-PR on labeled attack missions.
+are independent of embed_dim. Still a proxy for detection quality; the best
+configurations are ranked afterwards by AUC-PR on labeled attack missions.
 
 Diagnostics stored per trial (user attrs, not part of the ranking):
 per-epoch maxima of the training_step outputs and the gradient norm
