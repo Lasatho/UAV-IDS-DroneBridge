@@ -54,17 +54,41 @@ class AnomalyDetectionModel(nn.Module, ABC):
     def configure_optimizers(
         self, cfg: dict
     ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler | None]:
-        """Default: AdamW + optional cosine schedule. Override if needed."""
+        """Default: AdamW + optional cosine schedule, with linear LR warmup.
+
+        `warmup_epochs` ramps the LR linearly from near-zero to the
+        configured value before the main schedule takes over. Without it,
+        Transformer-based models (MTS-JEPA) see the full LR from step 1,
+        which destabilizes attention/LayerNorm weights early on and shows
+        up as steadily diverging train/val loss rather than convergence.
+        """
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=float(cfg["lr"]),
             weight_decay=float(cfg.get("weight_decay", 0.0)),
         )
-        scheduler = None
+        warmup_epochs = int(cfg.get("warmup_epochs", 0))
+        epochs = int(cfg["epochs"])
+
+        main_scheduler = None
         if cfg.get("scheduler") == "cosine":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=int(cfg["epochs"])
+            main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(epochs - warmup_epochs, 1)
             )
+
+        if warmup_epochs <= 0:
+            return optimizer, main_scheduler
+
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, total_iters=warmup_epochs
+        )
+        if main_scheduler is None:
+            return optimizer, warmup_scheduler
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_epochs],
+        )
         return optimizer, scheduler
 
     # ------------------------------------------------------------------

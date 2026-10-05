@@ -83,8 +83,12 @@ class RSSM(AnomalyDetectionModel):
     @staticmethod
     def _split_stats(stats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mean, log_std = stats.chunk(2, dim=-1)
-        # Clamp for numerical stability
-        log_std = torch.clamp(log_std, -5.0, 2.0)
+        # Clamp for numerical stability. Floor raised from -5 to -3: at -5
+        # (std ~0.0067) the prior's variance can collapse near zero, and
+        # the KL term's 1/(2*var_p) factor then blows up on any batch
+        # where the posterior mean drifts from the prior mean, spiking
+        # the loss by several orders of magnitude (observed up to ~6e5).
+        log_std = torch.clamp(log_std, -3.0, 2.0)
         return mean, log_std
 
     @staticmethod

@@ -191,6 +191,14 @@ class MTSJEPA(AnomalyDetectionModel):
     def training_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
         mask = self._random_mask(batch.shape[0], batch.device)
         pred, target = self._forward_jepa(batch, mask)
+        # L2-normalize before the loss (as in SimSiam/BYOL/DINO): raw MSE in
+        # embedding space is not scale-invariant, and nothing else bounds
+        # the embedding scale (patch_embed/LayerNorm gains/mask_token can
+        # grow unchecked), so the loss keeps climbing even while online and
+        # target track each other closely — the absolute error grows with
+        # the shared scale, not with a real drop in prediction quality.
+        pred = F.normalize(pred, dim=-1)
+        target = F.normalize(target, dim=-1)
         loss = F.mse_loss(pred, target)
         return {"loss": loss}
 
@@ -205,6 +213,10 @@ class MTSJEPA(AnomalyDetectionModel):
         ctx_in = torch.where(mask.unsqueeze(-1), mask_tok.expand(B, -1, -1), tokens)
         pred = self.predictor(self.context_encoder(ctx_in))
         tgt = self.target_encoder(self.target_patch_embed(patches) + self.pos_embed)
+        # Same normalization as training_step, so scores are on the same
+        # (scale-independent) footing the model was actually trained on.
+        pred = F.normalize(pred, dim=-1)
+        tgt = F.normalize(tgt, dim=-1)
         err = ((pred - tgt) ** 2).mean(dim=-1)  # (B, N)
         # Mean prediction error over masked positions only
         return (err * mask).sum(dim=1) / mask.sum(dim=1)
