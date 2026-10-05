@@ -52,12 +52,16 @@ model:
     free_nats: 1.0
 
   mts_jepa:
-    patch_length: 8
+    # Fixed, not tuned: patch_length/mask_ratio define the prediction task
+    # itself, so losses across different values are not comparable. 4 steps
+    # = 1 s at 4 Hz (attitude/thrust response time scale), 16 tokens per
+    # window. See docs/training_runs_4hz.md, section 5.
+    patch_length: 4
     embed_dim: 128
     depth: 4
     num_heads: 4
     predictor_depth: 2
-    mask_ratio: 0.5
+    mask_ratio: 0.6
     ema_decay: 0.996
 
   hassler:

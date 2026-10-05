@@ -189,7 +189,13 @@ class MTSJEPA(AnomalyDetectionModel):
     # ------------------------------------------------------------------
 
     def training_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
-        mask = self._random_mask(batch.shape[0], batch.device)
+        # Random mask while training; the fixed eval mask in eval mode, so
+        # validation loss is not subject to mask-sampling noise and is
+        # comparable between epochs and runs.
+        if self.training:
+            mask = self._random_mask(batch.shape[0], batch.device)
+        else:
+            mask = self.eval_mask.unsqueeze(0).expand(batch.shape[0], -1)
         pred, target = self._forward_jepa(batch, mask)
         # L2-normalize before the loss (as in SimSiam/BYOL/DINO): raw MSE in
         # embedding space is not scale-invariant, and nothing else bounds

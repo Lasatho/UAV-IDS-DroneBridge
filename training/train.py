@@ -113,7 +113,12 @@ class MetricLogger:
 def train_one_epoch(
     model, loader, optimizer, device, grad_clip: float,
     mlog: MetricLogger, global_step: int, log_every: int,
+    max_stats: dict | None = None,
 ) -> tuple[float, int]:
+    """One training epoch. If `max_stats` is given, it is filled with the
+    per-epoch maximum of every training_step output (e.g. `kl_dyn`) and of
+    the pre-clipping gradient norm (`grad_norm`) — diagnostics only, the
+    training itself is unaffected."""
     model.train()
     total, n = 0.0, 0
     for batch in loader:
@@ -123,10 +128,21 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        grad_norm = None
         if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         model.on_train_batch_end()
+
+        if max_stats is not None:
+            vals = {k: v.item() for k, v in out.items()}
+            if grad_norm is not None:
+                vals["grad_norm"] = grad_norm.item()
+            for k, v in vals.items():
+                cur = max_stats.get(k)
+                # NaN stays sticky (max() would silently drop it)
+                if cur is None or v != v or (cur == cur and v > cur):
+                    max_stats[k] = v
 
         total += loss.item() * batch.shape[0]
         n += batch.shape[0]
