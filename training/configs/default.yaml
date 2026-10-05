@@ -10,8 +10,10 @@ data:
   telemetry_dir: "${data.dataset_dir}/telemetry"
   network_dir: "${data.dataset_dir}/network"  # future use
 
-  # Resampling: align all message types to common frequency
-  resample_freq_hz: 10  # Hz
+  # Resampling: align all message types to common frequency.
+  # 4 Hz = native telemetry rate of the SITL recordings (MAVProxy default
+  # stream rate); higher values would only repeat samples.
+  resample_freq_hz: 4  # Hz
 
   # Sliding window
   window_length: 64     # timesteps per sample

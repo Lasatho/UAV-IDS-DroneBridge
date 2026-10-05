@@ -254,8 +254,8 @@ dataset/telemetry/
     │
     ├── discover_missions()          # Findet vollständige Missionen (alle 5 CSV-Typen)
     ├── split_missions()             # Mission-level Split (70/15/15, seed-deterministisch)
-    ├── load_mission()               # Lädt 5 CSVs, aligned auf gemeinsames Zeitraster
-    │    └── merge_asof (LOCF)       # Last-observation-carried-forward, Toleranz 2 Perioden
+    ├── load_mission()               # Lädt 5 CSVs, aligned auf gemeinsame Zeitachse
+    │    └── merge_asof (nearest)    # Referenz-Samples als Zeitschritte, übrige Typen nächstes Sample (±½ Periode)
     ├── Normalizer.fit(train)        # Z-Score per Feature, nur auf Trainings-Split
     ├── .npy-Cache                   # dataset/cache/{freq}hz_{feature_hash}/
     └── TelemetryWindowDataset       # Sliding Windows (B, T, F) mit build_window_index()
@@ -264,8 +264,8 @@ dataset/telemetry/
 **Wichtig:** Der Split erfolgt auf Mission-Ebene, nicht auf Fenster-Ebene, um temporale Datenlecks zu verhindern.
 
 Default-Parameter (in `configs/default.yaml`):
-- Resampling: 10 Hz
-- Fensterlänge: 64 Timesteps (6,4 Sekunden)
+- Resampling: 4 Hz (native Telemetrierate der SITL-Aufzeichnungen, MAVProxy-Default-Streamrate; 50-Hz-Anfangsphase wird auf 4 Hz ausgedünnt)
+- Fensterlänge: 64 Timesteps (16 Sekunden)
 - Stride: 16 Timesteps
 - Normalisierung: Z-Score
 - Features: alle 5 Nachrichtentypen → 37 Features
@@ -306,7 +306,7 @@ Läuft nur bis zum Cache (kein Training). Die Logausgabe nennt den exakten
 Pfad, z.B.:
 
 ```
-Cache directory: ./dataset/cache/10hz_3f2a9c1d
+Cache directory: ./dataset/cache/4hz_3f2a9c1d
 ```
 
 **Schritt 2: Upload:** Genau diesen Ordner (`dataset/cache/<freq>hz_<hash>/`)
@@ -590,7 +590,7 @@ generate_missions.py
         training/data/preprocessing.py
                 │
                 ├── discover_missions()      (prüft auf vollständige CSV-Sätze)
-                ├── load_mission()           (5 CSVs → gemeinsames 10Hz-Raster)
+                ├── load_mission()           (5 CSVs → gemeinsame 4-Hz-Zeitachse)
                 ├── Normalizer.fit()         (Z-Score, nur auf train-Split)
                 └── dataset/cache/          (.npy-Arrays + normalizer.json)
                         │

@@ -8,10 +8,15 @@ computation/application.
 Design decisions:
 - Alignment key is `host_timestamp_ns` (clock on the capture host),
   shared across all message types of a mission.
-- Each message type arrives at its own rate. All types are resampled
-  onto a uniform grid via merge_asof (last-observation-carried-forward,
-  bounded by a tolerance) so that one row = one timestep with the full
-  feature vector.
+- The time axis is sample-driven, not a fixed host-clock grid: one
+  reference message type defines the timesteps, all other types are
+  matched to the nearest sample. A fixed grid would pick samples twice
+  or skip them whenever host arrival jitters or SITL runs slower than
+  real time, producing artificial staircase steps.
+- The SITL recordings arrive at 4 Hz (MAVProxy's default stream rate
+  overrides the logger's 50 Hz request a few seconds into each mission).
+  The initial 50 Hz segment is thinned out on the autopilot clock so the
+  whole mission has a uniform cadence of ~resample_freq_hz.
 - Output column order is defined by features.get_feature_columns() and
   is identical for every mission (stable model input layout).
 """
@@ -28,6 +33,7 @@ import pandas as pd
 from .features import (
     MESSAGE_FEATURES,
     TIMESTAMP_COL,
+    TIMESTAMP_FIELDS,
     get_feature_columns,
 )
 
@@ -71,18 +77,61 @@ def discover_missions(telemetry_dir: str | Path) -> list[str]:
 # Per-mission loading + alignment
 # ---------------------------------------------------------------------------
 
+# Minimum spacing of kept reference samples, as a fraction of the target
+# period. Below 1.0 so that native samples at exactly the target rate
+# (and slight autopilot jitter) are never dropped; the 50 Hz start
+# segment is thinned to every 12th sample (240 ms at 4 Hz).
+_MIN_SPACING_FRACTION = 0.9
+
+
+def _autopilot_time_ns(df: pd.DataFrame, msg_type: str) -> np.ndarray:
+    """Autopilot clock of a message type in ns, host clock as fallback.
+
+    Recordings without an autopilot timestamp (e.g. converted FlyPaw
+    data) only carry the host timestamp.
+    """
+    field = TIMESTAMP_FIELDS[msg_type][0]
+    if field not in df.columns:
+        return df[TIMESTAMP_COL].to_numpy(dtype=np.int64)
+    scale = 1_000_000 if field.endswith("_ms") else 1_000
+    return df[field].to_numpy(dtype=np.int64) * scale
+
+
+def _thin_out(t_ns: np.ndarray, min_spacing_ns: int) -> np.ndarray:
+    """Boolean mask keeping samples at least min_spacing_ns apart.
+
+    A backwards jump of the clock (autopilot reboot) restarts the
+    spacing instead of suppressing all following samples.
+    """
+    keep = np.zeros(len(t_ns), dtype=bool)
+    last = None
+    for i, t in enumerate(t_ns):
+        if last is None or t - last >= min_spacing_ns or t < last:
+            keep[i] = True
+            last = t
+    return keep
+
+
 def load_mission(
     telemetry_dir: str | Path,
     mission_id: str,
-    resample_freq_hz: float = 10.0,
+    resample_freq_hz: float = 4.0,
     enabled_messages: dict[str, bool] | None = None,
 ) -> pd.DataFrame:
-    """Load one mission and align all message types onto a uniform grid.
+    """Load one mission and align all message types onto a common time axis.
+
+    The first enabled message type is the reference: its samples, thinned
+    to ~resample_freq_hz on the autopilot clock, are the timesteps. Every
+    other message type contributes its nearest sample within half a
+    period, so no sample is repeated as long as all types arrive at the
+    target rate.
 
     Args:
         telemetry_dir: Directory containing the per-mission CSVs.
         mission_id: e.g. "mission_00001".
-        resample_freq_hz: Target grid frequency.
+        resample_freq_hz: Target cadence. Should not exceed the native
+            rate of the recordings, otherwise nothing is thinned and the
+            native rate is kept.
         enabled_messages: Message-type toggle dict (None = all enabled).
 
     Returns:
@@ -108,7 +157,8 @@ def load_mission(
         if not path.exists():
             raise FileNotFoundError(path)
 
-        df = pd.read_csv(path, usecols=[TIMESTAMP_COL] + feats)
+        wanted = {TIMESTAMP_COL, TIMESTAMP_FIELDS[msg_type][0], *feats}
+        df = pd.read_csv(path, usecols=lambda c: c in wanted)
         df = df.sort_values(TIMESTAMP_COL).drop_duplicates(
             subset=TIMESTAMP_COL, keep="last"
         )
@@ -124,21 +174,32 @@ def load_mission(
     if t_end <= t_start:
         raise ValueError(f"{mission_id}: empty overlapping time range")
 
-    grid = pd.DataFrame(
-        {TIMESTAMP_COL: np.arange(t_start, t_end + 1, period_ns, dtype=np.int64)}
+    ref_type = next(iter(frames))
+    ref = frames[ref_type]
+    ref = ref[(ref[TIMESTAMP_COL] >= t_start) & (ref[TIMESTAMP_COL] <= t_end)]
+    keep = _thin_out(
+        _autopilot_time_ns(ref, ref_type),
+        int(_MIN_SPACING_FRACTION * period_ns),
     )
+    ref_cols = [TIMESTAMP_COL] + [
+        c for c in ref.columns if c.startswith(f"{ref_type}__")
+    ]
+    aligned = ref.loc[keep, ref_cols].reset_index(drop=True)
 
-    # merge_asof: for each grid point take the most recent observation.
-    # Tolerance = 2 grid periods; beyond that the value is NaN and we
-    # forward-fill afterwards (sensor dropouts are not expected in SITL data).
-    aligned = grid
+    # Nearest sample within half a period; misses stay NaN and are
+    # forward-filled afterwards (dropouts are rare in SITL data).
     for msg_type, df in frames.items():
+        if msg_type == ref_type:
+            continue
+        cols = [TIMESTAMP_COL] + [
+            c for c in df.columns if c.startswith(f"{msg_type}__")
+        ]
         aligned = pd.merge_asof(
             aligned,
-            df,
+            df[cols],
             on=TIMESTAMP_COL,
-            direction="backward",
-            tolerance=2 * period_ns,
+            direction="nearest",
+            tolerance=period_ns // 2,
         )
 
     feature_cols = get_feature_columns(enabled_messages)
