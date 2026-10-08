@@ -7,6 +7,7 @@ labeled dataset runs. Each run produces:
   - data/pcap/<mission_id>.pcap
   - data/telemetry/<mission_id>_<MSG_TYPE>.csv
   - data/phase_labels/<mission_id>.json
+  - data/wind/<mission_id>_wind.csv (commanded wind series)
 
 Usage:
     python3 orchestrator.py --manifest ./dataset/missions_manifest.csv --output ./dataset
@@ -24,8 +25,11 @@ from pathlib import Path
 from datetime import datetime
 import math
 import random
+import threading
 
 from pymavlink import mavutil
+
+from wind_model import WindModel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +43,47 @@ log = logging.getLogger(__name__)
 # subscribe to the same topic.
 # ---------------------------------------------------------------------------
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
+
+# Attack runs keep recording this long after the attack has ended, even if
+# the vehicle disarmed (landed, crashed, terminated) during the attack: the
+# post-attack phase is part of the attack sample. 30 s covers a LAND descent
+# from 15 m and holds at least one full 16 s window (64 samples at 4 Hz).
+ATTACK_POST_WINDOW_S = 30.0
+
+# Gazebo model and its spawn pose from the world SDF (iris_runway.sdf:
+# <pose degrees="true">0 0 0.195 0 0 90</pose>); yaw 90 deg as quaternion.
+GZ_WORLD = "iris_runway"
+GZ_MODEL = "iris_with_gimbal"
+GZ_SPAWN_POSE = ("position: {x: 0, y: 0, z: 0.195}, "
+                 "orientation: {x: 0, y: 0, z: 0.7071068, w: 0.7071068}")
+
+# Wind: the orchestrator publishes a time-varying mean wind vector
+# (wind_model.py) at WIND_RATE_HZ during the flight and zero wind before and
+# after it. The WindEffects low-pass (time_for_rise in the world SDF) is set
+# to one update period so the published series reaches the model unchanged.
+WIND_TOPIC = f"/world/{GZ_WORLD}/wind"
+WIND_RATE_HZ = 4.0
+
+# Between missions the orchestrator holds while this flag exists, so the
+# watchdog can restart gazebo+ardupilot without hitting a pose reset or SITL
+# reboot. After the flag is removed the SITL is rebooted again.
+PAUSE_FLAG = ".pause_orchestrator"
+
+# WORKAROUND (2026-10-08): with Gazebo wind the landed model keeps being
+# pushed, ArduCopter's land detector never triggers and the vehicle stays
+# armed on the ground until the mission timeout (75 min for normal runs).
+# The orchestrator treats the vehicle as landed after LANDED_HOLD_S of
+# relative altitude < LANDED_ALT_M and near-zero velocity (after having been
+# above AIRBORNE_ALT_M), force-disarms it and marks this in the label.
+LANDED_ALT_M = 0.5
+LANDED_VH_MS = 0.3
+LANDED_VZ_MS = 0.2
+LANDED_HOLD_S = 10.0
+AIRBORNE_ALT_M = 5.0
+
+# Child processes (tcpdump, telemetry logger, attack scripts) get this long
+# to exit after SIGTERM before they are killed.
+CHILD_STOP_TIMEOUT_S = 15.0
 
 
 def notify(message: str):
@@ -58,6 +103,21 @@ def notify(message: str):
         pass
 
 
+def stop_process(proc: subprocess.Popen, name: str):
+    """SIGTERM, then SIGKILL if the process does not exit in time.
+
+    A child that hangs (e.g. blocked waiting for a MAVLink link that is
+    gone) must not block the whole dataset run.
+    """
+    proc.terminate()
+    try:
+        proc.wait(timeout=CHILD_STOP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        log.warning(f"  {name} did not exit after SIGTERM — killing")
+        proc.kill()
+        proc.wait()
+
+
 class Orchestrator:
     def __init__(self, output_dir: Path, manifest_path: Path,
                  connection: str):
@@ -73,6 +133,7 @@ class Orchestrator:
         (output_dir / "pcap").mkdir(parents=True, exist_ok=True)
         (output_dir / "telemetry").mkdir(parents=True, exist_ok=True)
         (output_dir / "phase_labels").mkdir(parents=True, exist_ok=True)
+        (output_dir / "wind").mkdir(parents=True, exist_ok=True)
 
     def _bind_vehicle_heartbeat(self, timeout=60):
         """Bind the connection target to the real ArduPilot vehicle.
@@ -143,25 +204,41 @@ class Orchestrator:
         )
 
     def set_params(self, params: dict):
-        """Send PARAM_SET for each drone parameter."""
+        """Send PARAM_SET for each drone parameter and require confirmation.
+
+        The autopilot answers with PARAM_VALUE carrying the new value.
+        Unknown parameter names are ignored silently by ArduPilot (no
+        PARAM_VALUE) — this is how the v1 presets (WPNAV_*, renamed in
+        ArduCopter 4.8) never took effect. A parameter that is not
+        confirmed with the requested value fails the run.
+        """
         while self.conn.recv_match(blocking=False) is not None:
             pass
         for param_id, value in params.items():
-            log.info(f"  PARAM_SET {param_id} = {value}")
-            self.conn.mav.param_set_send(
-                self.conn.target_system,
-                self.conn.target_component,
-                param_id.encode("utf-8"),
-                float(value),
-                mavutil.mavlink.MAV_PARAM_TYPE_REAL32
-            )
-            ack = self.conn.recv_match(
-                type="PARAM_VALUE", blocking=True, timeout=5.0
-            )
-            if ack and ack.param_id.strip("\x00") == param_id:
-                log.info(f"  {param_id} confirmed = {ack.param_value}")
-            else:
-                log.warning(f"  No confirmation for {param_id}")
+            confirmed = None
+            for attempt in range(3):
+                log.info(f"  PARAM_SET {param_id} = {value}")
+                self.conn.mav.param_set_send(
+                    self.conn.target_system,
+                    self.conn.target_component,
+                    param_id.encode("utf-8"),
+                    float(value),
+                    mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+                )
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    ack = self.conn.recv_match(
+                        type="PARAM_VALUE", blocking=True, timeout=1.0
+                    )
+                    if ack and ack.param_id.strip("\x00") == param_id:
+                        confirmed = ack.param_value
+                        break
+                if confirmed is not None:
+                    break
+            if confirmed is None or abs(confirmed - float(value)) > 1e-3 * max(1.0, abs(float(value))):
+                raise RuntimeError(f"Parameter {param_id}={value} not confirmed "
+                                   f"(got {confirmed})")
+            log.info(f"  {param_id} confirmed = {confirmed}")
 
     def upload_mission(self, waypoint_file: Path):
         """Parse QGC WPL 110 file and upload mission items via pymavlink."""
@@ -177,6 +254,7 @@ class Orchestrator:
                 items.append(parts)
 
         n = len(items)
+        self.mission_count = n
         log.info(f"  Uploading {n} mission items from {waypoint_file.name}")
 
         self.conn.mav.mission_count_send(
@@ -226,10 +304,11 @@ class Orchestrator:
 
     def estimate_mission_timeout(self, wp_path: Path, meta: dict) -> int:
         """Fixed timeout: 10 min for attack runs (failsafe/hold is the
-        expected attack effect), 30 min for normal missions."""
+        expected attack effect), 75 min for normal missions (longest v2
+        mission, conservative preset at 3 m/s, is estimated at ~60 min)."""
         if meta.get("attack_type", "none") != "none":
             return 600
-        return 1800
+        return 4500
         # """Estimate max mission duration from actualy waypoint distances"""
         # wps = []
         # with open(wp_path, "r") as f:
@@ -271,34 +350,86 @@ class Orchestrator:
         #          f"dist={total_dist:.0f}m, rtl={rtl_overhead_s:.0f}s, {speed_ms:.1f} m/s)")
         # return timeout
 
-    def configure_wind(self, wind_params: dict, wind_direction_deg: int):
-        """Set the Gazebo wind for this mission via the WindEffects topic.
+    def _wind_publisher(self):
+        """Lazily advertise the WindEffects topic (gz-transport, in-process).
 
-        Publishes the mean wind velocity to /world/iris_runway/wind. Gust
-        turbulence is fixed in the world SDF (the Wind message only carries
-        the mean vector). World frame is ENU (x=East, y=North, z=Up); the
-        wind_direction_deg is the azimuth the wind blows *from* (0=N, 90=E),
-        so the air velocity points toward direction+180.
+        The gz CLI needs ~2 s per call, too slow for gusts. Raises if no
+        subscriber (Gazebo) shows up: flying without the configured wind
+        would silently produce mislabeled data.
         """
-        speed = (wind_params.get("speed_min", 0.0)
-                 + wind_params.get("speed_max", 0.0)) / 2.0
-        theta = math.radians(wind_direction_deg)
-        vx = -speed * math.sin(theta)   # East component
-        vy = -speed * math.cos(theta)   # North component
-        vz = 0.0
-        msg = (f"linear_velocity: {{x: {vx:.4f}, y: {vy:.4f}, z: {vz:.4f}}}, "
-               f"enable_wind: true")
-        try:
-            subprocess.run(
-                ["gz", "topic", "-t", "/world/iris_runway/wind",
-                 "-m", "gz.msgs.Wind", "-p", msg],
-                timeout=5, check=False,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            log.info(f"  Wind: {speed:.1f} m/s from {wind_direction_deg}° "
-                     f"(v_ENU=({vx:.2f}, {vy:.2f}, {vz:.2f}))")
-        except Exception as e:
-            log.warning(f"  Wind config failed ({e}) — flying without wind")
+        if getattr(self, "_wind_pub", None) is None:
+            from gz.transport13 import Node
+            from gz.msgs10.wind_pb2 import Wind
+            self._wind_node = Node()
+            self._wind_msg_type = Wind
+            self._wind_pub = self._wind_node.advertise(WIND_TOPIC, Wind)
+        for _ in range(50):
+            if self._wind_pub.has_connections():
+                return self._wind_pub
+            time.sleep(0.1)
+        raise RuntimeError(f"No subscriber on {WIND_TOPIC} (Gazebo down?)")
+
+    def publish_wind(self, vx: float, vy: float):
+        """World frame ENU (x=East, y=North, z=Up)."""
+        msg = self._wind_msg_type()
+        msg.linear_velocity.x = vx
+        msg.linear_velocity.y = vy
+        msg.linear_velocity.z = 0.0
+        msg.enable_wind = True
+        self._wind_pub.publish(msg)
+
+    def zero_wind(self):
+        """Calm air before takeoff and after the flight (a leftover wind
+        pushes the landed model and the next mission's ground phase)."""
+        self._wind_publisher()
+        for _ in range(3):
+            self.publish_wind(0.0, 0.0)
+            time.sleep(1 / WIND_RATE_HZ)
+
+    def start_wind(self, mission_id: str, wind_params: dict,
+                   wind_direction_deg: int) -> dict:
+        """Start publishing the mission's time-varying wind in a thread.
+
+        Seeded from the mission number (reproducible). The commanded series
+        is written to <output>/wind/<mission_id>_wind.csv.
+        """
+        self._wind_publisher()
+        seed = int(mission_id.split("_")[-1])
+        model = WindModel(wind_params, wind_direction_deg, seed)
+        path = self.output_dir / "wind" / f"{mission_id}_wind.csv"
+        stop = threading.Event()
+
+        def loop():
+            dt = 1 / WIND_RATE_HZ
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["host_time", "speed", "direction_deg", "gust",
+                            "v_east", "v_north"])
+                nxt = time.time()
+                while not stop.is_set():
+                    speed, direction, gust = model.step(dt)
+                    vx, vy = WindModel.to_enu(speed, direction)
+                    self.publish_wind(vx, vy)
+                    w.writerow([f"{time.time():.3f}", f"{speed:.3f}",
+                                f"{direction:.1f}", f"{gust:.3f}",
+                                f"{vx:.3f}", f"{vy:.3f}"])
+                    nxt += dt
+                    stop.wait(max(0.0, nxt - time.time()))
+
+        self._wind_stop = stop
+        self._wind_thread = threading.Thread(target=loop, daemon=True)
+        self._wind_thread.start()
+        log.info(f"  Wind: {model.turbulence}, {model.vmin:.1f}-{model.vmax:.1f} m/s "
+                 f"from {wind_direction_deg}° (seed={seed}) -> {path.name}")
+        return {**model.describe(), "seed": seed, "file": f"wind/{path.name}"}
+
+    def stop_wind(self):
+        """Stop the wind thread (if any) and set calm air."""
+        if getattr(self, "_wind_thread", None) is not None:
+            self._wind_stop.set()
+            self._wind_thread.join(timeout=5)
+            self._wind_thread = None
+        self.zero_wind()
 
     def update_manifest_status(self, mission_id: str, new_status: str):
         """Update status column for mission_id in manifest CSV."""
@@ -416,24 +547,61 @@ class Orchestrator:
             ]
         )
 
-    def start_attack(self, attack_type: str, mission_id: str) -> subprocess.Popen:
+    def start_attack(self, attack_type: str, mission_id: str,
+                     attack_variant: str = None) -> subprocess.Popen:
         """Start an attack script as a subprocess."""
         script = Path(f"attacks/{attack_type}.py")
-        log.info(f"[!] Starting attack: {attack_type}")
+        cmd = ["python3", str(script), "--mission-id", mission_id]
+        if attack_variant:
+            cmd += ["--variant", attack_variant]
+        log.info(f"[!] Starting attack: {attack_type}"
+                 + (f" ({attack_variant})" if attack_variant else ""))
+        # stderr is not read: a PIPE would fill up and block the script.
         return subprocess.Popen(
-            ["python3", str(script), "--mission-id", mission_id],
+            cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE
+            stderr=subprocess.DEVNULL
         )
     
     def wait_mission_complete(self, timeout=900, attack_type="none",
                               attack_start_offset=None, attack_duration=None,
-                              mission_id=None):
+                              mission_id=None, attack_variant=None) -> dict:
+        """Monitor the flight until it is over; run the attack in between.
+
+        Normal runs end at the first sign the flight is over ("Mission
+        Complete", a disarm STATUSTEXT, or a disarmed heartbeat).
+
+        Attack runs: the attack always runs for its scheduled duration, and
+        recording continues until ATTACK_POST_WINDOW_S after the attack has
+        ended, even if the vehicle disarmed earlier (LAND/crash/flight
+        termination are attack effects, not the end of the sample). The run
+        then ends once the flight is over, or at the timeout.
+
+        Returns a dict with mission_complete (the last mission item was
+        reached or "Mission Complete" seen; a disarm alone does not count),
+        reached waypoints, attack start/end, disarm time/reason, flight mode
+        changes and all STATUSTEXTs.
+
+        ArduCopter 4.8 sends no "Mission Complete" for missions ending in an
+        RTL item; MISSION_ITEM_REACHED of that last item arrives on landing.
+        """
         log.info(f"  Waiting for mission complete (timeout={timeout}s)...")
         deadline = time.time() + timeout
         min_flight_time = time.time() + 60
         reached = set()
         first_wp_time = None
+
+        # Flight state
+        mission_complete = False
+        last_seq = getattr(self, "mission_count", 0) - 1
+        disarm_time = None
+        disarm_reason = None
+        mode = None
+        mode_changes = []
+        statustext = []
+        was_airborne = False
+        on_ground_since = None
+        landed_by_orchestrator = False
 
         # Attack state
         attack_proc = None
@@ -442,9 +610,35 @@ class Orchestrator:
         attack_end_ts = None
         attack_ready = False  # True once first WP reached + 60s flying
 
+        def flight_over() -> bool:
+            return mission_complete or disarm_time is not None
+
+        def run_done() -> bool:
+            if not flight_over():
+                return False
+            if attack_type == "none" or not attack_started:
+                return True
+            return (attack_end_ts is not None
+                    and time.time() >= attack_end_ts + ATTACK_POST_WINDOW_S)
+
+        def result(timed_out: bool) -> dict:
+            return {
+                "mission_complete": mission_complete,
+                "timed_out": timed_out,
+                "reached": reached,
+                "attack_start": attack_start_ts,
+                "attack_end": attack_end_ts,
+                "disarm_time": disarm_time,
+                "disarm_reason": disarm_reason,
+                "mode_changes": mode_changes,
+                "statustext": statustext,
+                "landed_by_orchestrator": landed_by_orchestrator,
+            }
+
         while time.time() < deadline and self.keep_running:
             msg = self.conn.recv_match(
-                type=["STATUSTEXT", "MISSION_ITEM_REACHED", "HEARTBEAT"],
+                type=["STATUSTEXT", "MISSION_ITEM_REACHED", "HEARTBEAT",
+                      "GLOBAL_POSITION_INT"],
                 blocking=True, timeout=2.0
             )
 
@@ -456,77 +650,122 @@ class Orchestrator:
                 attack_ready = True
                 log.info(f"  Attack window open (first WP + 60s flying)")
 
-            # Start attack at randomized offset
-            if (attack_ready and not attack_started
+            # Start attack at randomized offset (only while still flying)
+            if (attack_ready and not attack_started and not flight_over()
                     and attack_start_offset is not None
                     and time.time() - first_wp_time >= attack_start_offset):
-                attack_proc = self.start_attack(attack_type, mission_id)
+                attack_proc = self.start_attack(attack_type, mission_id,
+                                                attack_variant)
                 attack_start_ts = time.time()
                 attack_started = True
                 log.info(f"  [!] Attack {attack_type} STARTED at offset "
                          f"{time.time() - first_wp_time:.0f}s")
 
-            # Stop attack after duration
+            # Stop attack after its scheduled duration
             if (attack_started and attack_proc is not None
                     and attack_end_ts is None
                     and time.time() - attack_start_ts >= attack_duration):
-                attack_proc.terminate()
-                attack_proc.wait()
+                stop_process(attack_proc, f"attack {attack_type}")
                 attack_end_ts = time.time()
                 log.info(f"  [!] Attack {attack_type} STOPPED after "
                          f"{attack_duration:.0f}s")
 
-            if msg is None:
-                continue
+            if msg is not None:
+                mtype = msg.get_type()
+                now = time.time()
 
-            mtype = msg.get_type()
+                if mtype == "MISSION_ITEM_REACHED":
+                    reached.add(msg.seq)
+                    if first_wp_time is None:
+                        first_wp_time = now
+                    if last_seq > 0 and msg.seq == last_seq:
+                        mission_complete = True
+                    log.info(f"  WP {msg.seq} reached ({len(reached)} total)")
 
-            if mtype == "MISSION_ITEM_REACHED":
-                reached.add(msg.seq)
-                if first_wp_time is None:
-                    first_wp_time = time.time()
-                log.info(f"  WP {msg.seq} reached ({len(reached)} total)")
+                elif mtype == "STATUSTEXT":
+                    text = msg.text.strip()
+                    log.info(f"  STATUSTEXT: {text}")
+                    statustext.append([now, text])
+                    if "Mission Complete" in text:
+                        mission_complete = True
+                    if ("Auto disarmed" in text or "Disarming" in text) \
+                            and disarm_time is None:
+                        disarm_time = now
+                    # Keep the most specific disarm cause, e.g.
+                    # "Crash: Disarming: AngErr=..." over "Disarming motors".
+                    if ("Disarm" in text or "Crash" in text
+                            or "Terminat" in text) and (
+                            disarm_reason is None
+                            or disarm_reason == "Disarming motors"):
+                        disarm_reason = text
 
-            elif mtype == "STATUSTEXT":
-                text = msg.text.strip()
-                log.info(f"  STATUSTEXT: {text}")
-                if ("Mission Complete" in text or
-                    "Auto disarmed" in text or
-                    "Disarming motors" in text):
-                    log.info(f"  Mission complete! WPs reached: {len(reached)}")
-                    # Clean up attack if still running
-                    if attack_proc is not None and attack_end_ts is None:
-                        attack_proc.terminate()
-                        attack_proc.wait()
-                        attack_end_ts = time.time()
-                    return True, reached, attack_start_ts, attack_end_ts
+                elif mtype == "GLOBAL_POSITION_INT":
+                    if msg.get_srcSystem() == 0:
+                        pass
+                    elif msg.relative_alt / 1000.0 > AIRBORNE_ALT_M:
+                        was_airborne = True
+                        on_ground_since = None
+                    elif (was_airborne and disarm_time is None
+                          and msg.relative_alt / 1000.0 < LANDED_ALT_M
+                          and math.hypot(msg.vx, msg.vy) / 100.0 < LANDED_VH_MS
+                          and abs(msg.vz) / 100.0 < LANDED_VZ_MS):
+                        if on_ground_since is None:
+                            on_ground_since = now
+                        elif now - on_ground_since >= LANDED_HOLD_S:
+                            log.info("  Landed but still armed — force disarm "
+                                     "(orchestrator land detection)")
+                            self.conn.mav.command_long_send(
+                                self.conn.target_system,
+                                self.conn.target_component,
+                                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                0, 0, 21196, 0, 0, 0, 0, 0
+                            )
+                            landed_by_orchestrator = True
+                            disarm_time = now
+                            disarm_reason = "landed, force-disarmed by orchestrator"
+                            # Landed after the last navigation item: the
+                            # mission was flown completely (RTL landing).
+                            if last_seq > 0 and reached and max(reached) >= last_seq - 1:
+                                mission_complete = True
+                    else:
+                        on_ground_since = None
 
-            elif mtype == "HEARTBEAT":
-                if msg.type != mavutil.mavlink.MAV_TYPE_QUADROTOR:
-                    continue
-                armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                if not armed and len(reached) > 0 and time.time() > min_flight_time:
-                    log.info(f"  Vehicle disarmed — mission done. "
-                             f"WPs reached: {len(reached)}")
-                    if attack_proc is not None and attack_end_ts is None:
-                        attack_proc.terminate()
-                        attack_proc.wait()
-                        attack_end_ts = time.time()
-                    return True, reached, attack_start_ts, attack_end_ts
+                elif mtype == "HEARTBEAT":
+                    if (msg.type == mavutil.mavlink.MAV_TYPE_QUADROTOR
+                            and msg.get_srcSystem() != 0):
+                        new_mode = mavutil.mode_string_v10(msg)
+                        if new_mode != mode:
+                            mode = new_mode
+                            mode_changes.append([now, mode])
+                        armed = (msg.base_mode
+                                 & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                        if (not armed and disarm_time is None
+                                and len(reached) > 0
+                                and now > min_flight_time):
+                            disarm_time = now
+                            log.info(f"  Vehicle disarmed. "
+                                     f"WPs reached: {len(reached)}")
 
-        # Timeout — clean up attack
+            if run_done():
+                log.info(f"  Run done (mission_complete={mission_complete}, "
+                         f"disarmed={disarm_time is not None}). "
+                         f"WPs reached: {len(reached)}")
+                return result(timed_out=False)
+
+        # Timeout (or shutdown) — clean up attack
         if attack_proc is not None and attack_end_ts is None:
-            attack_proc.terminate()
-            attack_proc.wait()
+            stop_process(attack_proc, f"attack {attack_type}")
             attack_end_ts = time.time()
 
         log.warning(f"  Timeout. Waypoints reached: {len(reached)}")
-        return False, reached, attack_start_ts, attack_end_ts
-    
+        return result(timed_out=True)
+
     def write_label(self, run_id: str, start_time: float, end_time: float,
                     attack_type: str = "none", attack_start: float = None,
                     attack_end: float = None, waypoints_reached: list = None,
-                    mission_success: bool = False):
+                    mission_success: bool = False, attack_variant: str = None,
+                    flight: dict = None, wind: dict = None):
+        flight = flight or {}
         label = {
             "run_id": run_id,
             "start_time": start_time,
@@ -538,6 +777,14 @@ class Orchestrator:
             "attack_start": attack_start,
             "attack_end": attack_end,
             "attack_duration": (attack_end - attack_start) if (attack_start and attack_end) else None,
+            "attack_variant": attack_variant,
+            "timed_out": flight.get("timed_out"),
+            "disarm_time": flight.get("disarm_time"),
+            "disarm_reason": flight.get("disarm_reason"),
+            "mode_changes": flight.get("mode_changes", []),
+            "statustext": flight.get("statustext", []),
+            "landed_by_orchestrator": flight.get("landed_by_orchestrator", False),
+            "wind": wind,
             "notes": ""
         }
         label_path = self.output_dir / "phase_labels" / f"{run_id}.json"
@@ -562,8 +809,48 @@ class Orchestrator:
         log.warning("[?] EKF not converged — trying anyway.")
         return False
 
+    def reset_vehicle_pose(self) -> bool:
+        """Put the Gazebo model back to its upright spawn pose.
+
+        A SITL reboot resets ArduPilot but not the Gazebo world: after a
+        crash the model stays upside down (no takeoff possible), and after
+        a landing away from home (failsafe, attack) the next mission would
+        start there instead of at the spawn point.
+        """
+        try:
+            r = subprocess.run(
+                ["gz", "service", "-s", f"/world/{GZ_WORLD}/set_pose",
+                 "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
+                 "--timeout", "3000",
+                 "--req", f'name: "{GZ_MODEL}", {GZ_SPAWN_POSE}'],
+                timeout=10, capture_output=True, text=True
+            )
+            ok = "data: true" in r.stdout
+        except Exception as e:
+            log.warning(f"  Pose reset failed ({e})")
+            return False
+        if ok:
+            log.info("[+] Vehicle reset to spawn pose")
+        else:
+            log.warning(f"  Pose reset failed: {r.stdout.strip()} {r.stderr.strip()}")
+        return ok
+
     def reboot_sitl(self):
-        """Send preflight reboot to reset SITL state."""
+        """Reset vehicle pose and SITL state between missions.
+
+        Force-disarm first: a vehicle still hovering after a timeout
+        (failsafe hold) would otherwise refuse the reboot, and the pose
+        reset must not teleport a powered vehicle.
+        """
+        self.conn.mav.command_long_send(
+            self.conn.target_system,
+            self.conn.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 0, 21196, 0, 0, 0, 0, 0  # param2=21196 = force disarm
+        )
+        time.sleep(2)
+        self.reset_vehicle_pose()
+        time.sleep(1)
         log.info("[+] Rebooting SITL...")
         self.conn.mav.command_long_send(
             self.conn.target_system,
@@ -575,7 +862,16 @@ class Orchestrator:
         self.conn = mavutil.mavlink_connection(self.connection)
         if not self._bind_vehicle_heartbeat():
             log.warning("[?] Only phantom heartbeat after reboot — retrying bind")
-            self._bind_vehicle_heartbeat()
+            if not self._bind_vehicle_heartbeat():
+                # No vehicle on the link (radio/proxy chain down). Continuing
+                # would bind to MAVProxy's phantom sysid 0 and send every
+                # command into the void. Stop and let the watchdog restart
+                # the stack.
+                log.error("No vehicle heartbeat after reboot — stopping.")
+                notify("[UAV-IDS] No vehicle heartbeat after reboot — stopping.")
+                self.keep_running = False
+                (self.output_dir / ".stop_orchestrator").touch()
+                return
         log.info(f"[+] SITL rebooted, heartbeat OK "
                  f"(sys {self.conn.target_system}:{self.conn.target_component}).")
 
@@ -626,8 +922,12 @@ class Orchestrator:
 
         atk_start = None
         atk_end = None
-            
+        flight = {}
+        wind = None
+        attack_variant = meta.get("attack_variant")
+
         try:
+            self.zero_wind()
             if not self.wait_for_ready():
                 raise RuntimeError("No GPS fix")
             self.wait_ekf_ready(timeout=30)
@@ -654,7 +954,8 @@ class Orchestrator:
             # Wind is still active for the whole waypoint mission and the
             # attack window (attacks fire mid-flight), only the ~12 s takeoff
             # is calm.
-            self.configure_wind(meta["wind_params"], meta["wind_direction_deg"])
+            wind = self.start_wind(mission_id, meta["wind_params"],
+                                   meta["wind_direction_deg"])
 
             # Now switch to AUTO — mission continues from WP2
             self.set_mode("AUTO")
@@ -685,13 +986,18 @@ class Orchestrator:
                          f"(seed={seed})")
 
             mission_timeout = self.estimate_mission_timeout(wp_path, meta)
-            success, reached_wps, atk_start, atk_end = self.wait_mission_complete(
+            flight = self.wait_mission_complete(
                 timeout=mission_timeout,
                 attack_type=attack_type,
                 attack_start_offset=attack_start_offset,
                 attack_duration=attack_duration,
-                mission_id=mission_id
+                mission_id=mission_id,
+                attack_variant=attack_variant
             )
+            success = flight["mission_complete"]
+            reached_wps = flight["reached"]
+            atk_start = flight["attack_start"]
+            atk_end = flight["attack_end"]
 
             if not success:
                 log.warning(f"  Mission {mission_id} did not complete cleanly")
@@ -699,16 +1005,20 @@ class Orchestrator:
             log.error(f"Run {mission_id} failed: {e}")
         finally:
             end_time = time.time()
-            tcpdump_proc.terminate()
-            tcpdump_proc.wait()
-            telemetry_proc.terminate()
-            telemetry_proc.wait()
+            try:
+                self.stop_wind()
+            except Exception as e:
+                log.error(f"  Could not reset wind: {e}")
+            stop_process(tcpdump_proc, "tcpdump")
+            stop_process(telemetry_proc, "telemetry logger")
             self.write_label(mission_id, start_time, end_time,
                              attack_type=meta.get("attack_type", "none"),
                              attack_start=atk_start,
                              attack_end=atk_end,
-                             waypoints_reached=list(reached_wps),
-                             mission_success=success)
+                             waypoints_reached=sorted(reached_wps),
+                             mission_success=success,
+                             attack_variant=attack_variant,
+                             flight=flight, wind=wind)
             # For attack runs a flight that got airborne and actually fired the
             # attack is valid data even if it never completed cleanly — the
             # failsafe/hold/termination is the attack effect, not a sim failure.
@@ -736,6 +1046,20 @@ class Orchestrator:
                     self.keep_running = False
                     (self.output_dir / ".stop_orchestrator").touch()
 
+            if self.keep_running:
+                self.reboot_sitl()
+
+    def wait_while_paused(self):
+        """Hold between missions while the watchdog's pause flag exists,
+        then reboot the SITL (gazebo/ardupilot may have been restarted)."""
+        flag = self.output_dir / PAUSE_FLAG
+        if not flag.exists():
+            return
+        log.info("Paused (watchdog flag) — waiting")
+        while flag.exists() and self.keep_running:
+            time.sleep(2)
+        if self.keep_running:
+            log.info("Resumed — rebooting SITL")
             self.reboot_sitl()
 
     def run(self):
@@ -749,6 +1073,11 @@ class Orchestrator:
             return
         
         self.connect()
+        # Start from a clean state (upright at the spawn point, fresh SITL),
+        # whatever the previous run or a watchdog restart left behind.
+        self.reboot_sitl()
+        if not self.keep_running:
+            return
 
         with open(self.manifest_path, "r", newline="") as f:
             reader = csv.DictReader(f)
@@ -770,6 +1099,9 @@ class Orchestrator:
                 notify(f"[UAV-IDS] Interrupted after {completed_count} completed, "
                        f"{failed_count} failed")
                 break
+            self.wait_while_paused()
+            if not self.keep_running:
+                continue
             log.info(f"[{done + i + 1}/{total}] Next: {mission['mission_id']}")
             self.run_single(mission)
 

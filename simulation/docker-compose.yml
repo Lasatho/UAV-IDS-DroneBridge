@@ -11,6 +11,9 @@ services:
       - DISPLAY=${DISPLAY}
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # world with WindEffects settings; mounted so it can change without
+      # rebuilding (and re-distributing) the gazebo image
+      - ./gazebo/worlds/iris_runway_wind.sdf:/opt/ardupilot_gazebo/worlds/iris_runway_wind.sdf:ro
     restart: unless-stopped
 
   ardupilot:

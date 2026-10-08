@@ -10,9 +10,13 @@
     gz topic -t /world/iris_runway/wind -m gz.msgs.Wind \
              -p 'linear_velocity: {x: <E>, y: <N>, z: 0}, enable_wind: true'
 
-  The mean wind vector is updated per mission; the gust/turbulence noise
-  below is fixed for the whole run (the Wind message only carries the mean
-  velocity, not the noise parameters).
+  The orchestrator publishes a time-varying mean wind vector at 4 Hz during
+  each flight (gusts and turbulence come from data/wind_model.py). The Wind
+  message only sets the seed; WindEffects low-passes the magnitude and
+  direction with time_for_rise, which is therefore set to one update period
+  (0.25 s) so the published series reaches the model unchanged. The noise
+  below is a small per-step jitter, the same for all wind profiles.
+  The file is bind-mounted into the gazebo container (docker-compose.yml).
 
   World frame is ENU: x = East, y = North, z = Up.
 -->
@@ -55,14 +59,14 @@
       name="gz::sim::systems::WindEffects">
       <horizontal>
         <magnitude>
-          <time_for_rise>10</time_for_rise>
+          <time_for_rise>0.25</time_for_rise>
           <noise type="gaussian">
             <mean>0</mean>
             <stddev>0.0005</stddev>
           </noise>
         </magnitude>
         <direction>
-          <time_for_rise>30</time_for_rise>
+          <time_for_rise>0.25</time_for_rise>
           <noise type="gaussian">
             <mean>0</mean>
             <stddev>0.03</stddev>
