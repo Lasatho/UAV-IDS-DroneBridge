@@ -77,16 +77,33 @@ class TelemetryLogger:
         for f in self.files.values():
             f.close()
 
-    def connect(self):
-        """Establish MAVLink connection via UDP."""
+    def connect(self) -> bool:
+        """Establish MAVLink connection via UDP and bind to the vehicle.
+
+        Waits for the heartbeat of the real autopilot, skipping MAVProxy's
+        phantom heartbeat (sysid 0), the same way the orchestrator binds.
+        The wait checks keep_running, so SIGTERM ends it: a plain
+        wait_heartbeat() blocks forever when the radio link is down, and
+        the orchestrator then hangs waiting for this process to exit.
+        Returns False if stopped before a vehicle heartbeat arrived.
+        """
         print(f"[*] Connecting to {self.connection_string}...")
         self.conn = mavutil.mavlink_connection(self.connection_string)
-        # Wait for first heartbeat to confirm link is alive
-        self.conn.wait_heartbeat()
-        print(f"[+] Heartbeat received from system "
-              f"{self.conn.target_system}:{self.conn.target_component}")
-        error_logger.info(f"[+] Heartbeat received from system "
-                         f"{self.conn.target_system}:{self.conn.target_component}")
+        while self.keep_running:
+            msg = self.conn.recv_match(type="HEARTBEAT", blocking=True,
+                                       timeout=1.0)
+            if (msg is None or msg.get_srcSystem() == 0
+                    or msg.type != mavutil.mavlink.MAV_TYPE_QUADROTOR):
+                continue
+            self.conn.target_system = msg.get_srcSystem()
+            self.conn.target_component = msg.get_srcComponent()
+            print(f"[+] Heartbeat received from system "
+                  f"{self.conn.target_system}:{self.conn.target_component}")
+            error_logger.info(f"[+] Heartbeat received from system "
+                             f"{self.conn.target_system}:{self.conn.target_component}")
+            return True
+        error_logger.warning("[?] Stopped before a vehicle heartbeat arrived")
+        return False
 
     def log_message(self, msg):
         """Write a single MAVLink message to its corresponding CSV."""
@@ -104,7 +121,8 @@ class TelemetryLogger:
 
     def run(self):
         """Main loop: receive messages until stopped."""
-        self.connect()
+        if not self.connect():
+            sys.exit(1)
         self.setup_files()
 
         # Request data streams from the autopilot — without this,
