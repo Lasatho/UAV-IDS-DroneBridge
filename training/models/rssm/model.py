@@ -20,7 +20,10 @@ shared KL term that free-nats clamping can silence entirely.
 
 Anomaly score = per-window mean of the one-step prediction error using
 the *prior* latent (the model predicts x_t before seeing it; deviation
-from the learned dynamics is the anomaly signal).
+from the learned dynamics is the anomaly signal). The first
+`score_burn_in` steps are excluded: each window starts from h = z = 0, so
+the early "predictions" only reflect the data variance (t = 0 error ~60x
+the steady-state error), not the learned dynamics.
 
 Gaussian latents are used instead of DreamerV3's categorical latents:
 they are ONNX-friendly and sufficient for low-dimensional telemetry.
@@ -53,6 +56,7 @@ class RSSM(AnomalyDetectionModel):
         kl_dyn_beta: float = 0.5,
         kl_rep_beta: float = 0.1,
         free_nats: float = 1.0,
+        score_burn_in: int = 4,
     ):
         super().__init__(num_features, window_length)
         self.stochastic_dim = stochastic_dim
@@ -60,6 +64,11 @@ class RSSM(AnomalyDetectionModel):
         self.kl_dyn_beta = kl_dyn_beta
         self.kl_rep_beta = kl_rep_beta
         self.free_nats = free_nats
+        if not 0 <= score_burn_in < window_length:
+            raise ValueError(
+                f"score_burn_in={score_burn_in} must be in [0, {window_length})"
+            )
+        self.score_burn_in = score_burn_in
 
         # Observation embedding
         self.obs_encoder = _mlp(num_features, hidden_dim, hidden_dim)
@@ -193,4 +202,4 @@ class RSSM(AnomalyDetectionModel):
         # One-step prediction error from the prior: how well does the
         # learned dynamics model predict the next observation?
         err = (out["recon_prior"] - batch) ** 2  # (B, T, F)
-        return err.mean(dim=(1, 2))
+        return err[:, self.score_burn_in:].mean(dim=(1, 2))

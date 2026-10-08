@@ -2,19 +2,26 @@
 Optuna hyperparameter search for the unsupervised anomaly detectors
 (rssm, mts_jepa).
 
-Objective: mean anomaly score on the validation split (best value seen
-across the trial's epochs), i.e. the quantity the IDS thresholds — not the
-training loss. The training loss is unsuitable here because tuned
+Objective: mean anomaly score on the validation split after the trial's
+last epoch, i.e. the quantity the IDS thresholds — not the training loss.
+The last epoch and not the best one: a configuration that diverges after
+an early optimum must not be ranked by its pre-divergence value. The training loss is unsuitable here because tuned
 hyperparameters change its formula (RSSM: kl_dyn_beta/free_nats set a hard
 lower bound) or its scale (MTS-JEPA: MSE over L2-normalized embeddings
 scales with 1/embed_dim). MTS-JEPA scores are converted to 1 - cos so they
 are independent of embed_dim. Still a proxy for detection quality; the best
 configurations are ranked afterwards by AUC-PR on labeled attack missions.
 
+Trials use the learning-rate schedule of a full training run (warmup +
+cosine over training.epochs from the config) and stop after --epochs
+epochs. A schedule compressed to the trial length would anneal the LR to
+~0 within the trial, hide instabilities that appear at high LR and tune
+the LR for a regime the full run never sees.
+
 Diagnostics stored per trial (user attrs, not part of the ranking):
 per-epoch maxima of the training_step outputs and the gradient norm
-(RSSM KL stability), and for MTS-JEPA the embedding spread / effective
-rank of the target embeddings (representation collapse check).
+(RSSM KL stability), and for MTS-JEPA the effective rank of the target
+embeddings (representation collapse check).
 
 Search space is joint per model (shared + architecture-specific
 hyperparameters sampled together, not staged) — see SEARCH_SPACES
@@ -36,7 +43,11 @@ mostly idle): start several processes on the same study, each with its own
     python tune.py --model rssm --n-trials 7 --epochs 12 --worker-id 1 &
 --n-trials counts per process.
 
-Results: optuna_studies/<study>.db (SQLite, default study <model>_score).
+Seed replicates of the best configurations of a finished study (separate
+study <source>_seeds, no pruning):
+    python tune.py --model rssm --replicate-from rssm_score1b --top 5 --seeds 1 2
+
+Results: optuna_studies/<study>.db (SQLite, default study <model>_score1b).
 Inspect with:
     optuna-dashboard sqlite:///optuna_studies/rssm_score.db
 """
@@ -71,14 +82,17 @@ logger = logging.getLogger("tune")
 def _rssm_space(trial: optuna.Trial) -> dict:
     return {
         "training": {
-            "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+            # Upper bounds from stage 1: lr > ~2e-3 or kl_dyn_beta > ~0.6
+            # led to KL explosions; the best configurations sat at the edge
+            # of the former architecture ranges (hidden 128, deterministic 256).
+            "lr": trial.suggest_float("lr", 1e-4, 2e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
         },
         "model": {
             "rssm": {
-                "hidden_dim": trial.suggest_categorical("hidden_dim", [128, 256, 512]),
-                "deterministic_dim": trial.suggest_categorical("deterministic_dim", [64, 128, 256]),
-                "kl_dyn_beta": trial.suggest_float("kl_dyn_beta", 0.1, 2.0, log=True),
+                "hidden_dim": trial.suggest_categorical("hidden_dim", [64, 128, 256]),
+                "deterministic_dim": trial.suggest_categorical("deterministic_dim", [128, 256, 512]),
+                "kl_dyn_beta": trial.suggest_float("kl_dyn_beta", 0.1, 0.8, log=True),
                 "free_nats": trial.suggest_float("free_nats", 0.5, 3.0),
             }
         },
@@ -88,14 +102,16 @@ def _rssm_space(trial: optuna.Trial) -> dict:
 def _mts_jepa_space(trial: optuna.Trial) -> dict:
     return {
         "training": {
-            "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+            # Stage 1: best lr 1.3e-4..9.5e-4 (lower edge opened), depth 6
+            # (upper edge, opened to 8), predictor_depth 1 (3 never competitive).
+            "lr": trial.suggest_float("lr", 5e-5, 2e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
         },
         "model": {
             "mts_jepa": {
                 "embed_dim": trial.suggest_categorical("embed_dim", [64, 128, 256]),
-                "depth": trial.suggest_categorical("depth", [2, 4, 6]),
-                "predictor_depth": trial.suggest_categorical("predictor_depth", [1, 2, 3]),
+                "depth": trial.suggest_categorical("depth", [4, 6, 8]),
+                "predictor_depth": trial.suggest_categorical("predictor_depth", [1, 2]),
             }
         },
     }
@@ -136,13 +152,14 @@ def val_score(model, model_name: str, loader, device) -> float:
 
 @torch.no_grad()
 def jepa_embedding_stats(model, loader, device, max_batches: int = 50) -> dict:
-    """Spread and effective rank of the (L2-normalized) target embeddings.
+    """Effective rank of the (L2-normalized) target embeddings.
 
     A low prediction error is only meaningful if the embeddings carry
     information; near-constant embeddings are trivially predictable.
-    emb_std: mean per-component std across tokens (0 = collapsed).
     emb_eff_rank: exp(entropy of the normalized singular values) of the
     centered token matrix (Roy & Vetterli 2007), between 1 and embed_dim.
+    (The per-component std is not reported: for unit vectors it is ~1/sqrt(D)
+    regardless of the information content.)
     """
     model.eval()
     embs = []
@@ -158,18 +175,26 @@ def jepa_embedding_stats(model, loader, device, max_batches: int = 50) -> dict:
     sv = torch.linalg.svdvals(z)
     p = sv / sv.sum()
     eff_rank = torch.exp(-(p * torch.log(p.clamp_min(1e-12))).sum()).item()
-    return {"emb_std": z.std(dim=0).mean().item(), "emb_eff_rank": eff_rank}
+    return {"emb_eff_rank": eff_rank}
 
 
 def make_objective(
     model_name: str, base_cfg: dict, loaders: dict, num_features: int,
-    device: torch.device, epochs: int,
+    device: torch.device, epochs: int, replicate: bool = False,
 ):
     quiet_logger = MetricLogger({"logging": {"backend": "none"}})
 
     def objective(trial: optuna.Trial) -> float:
+        if replicate and "seed" not in trial.user_attrs:
+            # Queue drained by another worker: the sampler proposed a new
+            # configuration, which does not belong in a replicate study.
+            trial.set_user_attr("not_a_replicate", True)
+            raise optuna.TrialPruned()
         cfg = _merge(base_cfg, SEARCH_SPACES[model_name](trial))
-        set_seed(int(cfg["seed"]))
+        # Seed replicates (--replicate-from) carry their own seed.
+        seed = int(trial.user_attrs.get("seed", cfg["seed"]))
+        trial.set_user_attr("seed", seed)
+        set_seed(seed)
 
         model = build_model(
             model_name,
@@ -179,7 +204,7 @@ def make_objective(
         ).to(device)
         optimizer, scheduler = model.configure_optimizers(cfg["training"])
 
-        best_score = float("inf")
+        score = float("nan")
         global_step = 0
         epoch_max: list[dict] = []
         for epoch in range(1, epochs + 1):
@@ -203,7 +228,6 @@ def make_objective(
                 trial.set_user_attr("diverged_at_epoch", epoch)
                 return float("nan")
 
-            best_score = min(best_score, score)
             trial.report(score, epoch)
             if trial.should_prune():
                 raise optuna.TrialPruned()
@@ -212,7 +236,7 @@ def make_objective(
             for k, v in jepa_embedding_stats(model, loaders["val"], device).items():
                 trial.set_user_attr(k, v)
 
-        return best_score
+        return score
 
     return objective
 
@@ -221,15 +245,41 @@ def make_objective(
 # Main
 # ---------------------------------------------------------------------------
 
-def _create_study(study_name: str, storage, cfg: dict, worker_id: int) -> optuna.Study:
+def _create_study(study_name: str, storage, cfg: dict, worker_id: int,
+                  pruning: bool = True) -> optuna.Study:
     return optuna.create_study(
         study_name=study_name,
         storage=storage,
         load_if_exists=True,
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=int(cfg["seed"]) + worker_id),
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
+        pruner=(optuna.pruners.MedianPruner(n_warmup_steps=5) if pruning
+                else optuna.pruners.NopPruner()),
     )
+
+
+def _enqueue_replicates(study: optuna.Study, source: optuna.Study,
+                        top: int, seeds: list[int]) -> None:
+    """Queue the `top` best completed configurations of `source` once per seed.
+
+    Idempotent: (params, seed) pairs already in `study` are skipped, so
+    parallel workers or restarts do not duplicate work.
+    """
+    # Waiting (enqueued, not yet started) trials hold their parameters in
+    # the "fixed_params" system attribute, not in .params.
+    done = {(tuple(sorted((t.params or t.system_attrs.get("fixed_params", {})).items())),
+             t.user_attrs.get("seed"))
+            for t in study.trials}
+    best = sorted(
+        (t for t in source.trials if t.state == optuna.trial.TrialState.COMPLETE),
+        key=lambda t: t.value,
+    )[:top]
+    for t in best:
+        for s in seeds:
+            if (tuple(sorted(t.params.items())), s) in done:
+                continue
+            study.enqueue_trial(t.params, user_attrs={"seed": s,
+                                                      "source_trial": t.number})
 
 
 def main() -> None:
@@ -242,8 +292,13 @@ def main() -> None:
                          help="Epochs per trial (< full training run; pruning cuts bad trials earlier)")
     parser.add_argument("--storage-dir", default="optuna_studies")
     parser.add_argument("--study-name", default=None,
-                        help="Default <model>_score (score-based objective; the "
-                             "earlier loss-based studies are kept as <model>.db)")
+                        help="Default <model>_score1b (stage 1b; earlier studies "
+                             "are kept as <model>.db and <model>_score.db)")
+    parser.add_argument("--replicate-from", default=None, metavar="STUDY",
+                        help="Re-train the --top best configurations of STUDY "
+                             "with each of --seeds (study STUDY_seeds, no pruning)")
+    parser.add_argument("--top", type=int, default=5)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--worker-id", type=int, default=0,
                         help="Distinct per parallel process on the same study "
                              "(offsets the TPE sampler seed)")
@@ -255,7 +310,10 @@ def main() -> None:
     )
 
     cfg = load_config(args.config, args.experiment, [])
-    cfg["training"]["epochs"] = args.epochs  # keep cosine schedule matched to per-trial budget
+    # training.epochs is NOT overridden: the LR schedule stays that of a full
+    # run, the trial just stops after --epochs epochs (see module docstring).
+    if args.epochs > int(cfg["training"]["epochs"]):
+        parser.error("--epochs exceeds training.epochs of the config")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
@@ -268,21 +326,47 @@ def main() -> None:
 
     storage_dir = Path(args.storage_dir)
     storage_dir.mkdir(parents=True, exist_ok=True)
-    study_name = args.study_name or f"{args.model}_score"
-    storage = optuna.storages.RDBStorage(
-        f"sqlite:///{storage_dir / study_name}.db",
-        # parallel workers write to the same SQLite file
-        engine_kwargs={"connect_args": {"timeout": 60}},
-    )
+    def _storage(name: str) -> optuna.storages.RDBStorage:
+        return optuna.storages.RDBStorage(
+            f"sqlite:///{storage_dir / name}.db",
+            # parallel workers write to the same SQLite file
+            engine_kwargs={"connect_args": {"timeout": 60}},
+        )
+
+    replicate = args.replicate_from is not None
+    if replicate:
+        study_name = args.study_name or f"{args.replicate_from}_seeds"
+    else:
+        study_name = args.study_name or f"{args.model}_score1b"
+    storage = _storage(study_name)
 
     # Parallel workers may race on study creation; the loser just loads it.
     try:
-        study = _create_study(study_name, storage, cfg, args.worker_id)
+        study = _create_study(study_name, storage, cfg, args.worker_id,
+                              pruning=not replicate)
     except optuna.exceptions.DuplicatedStudyError:
-        study = _create_study(study_name, storage, cfg, args.worker_id)
+        study = _create_study(study_name, storage, cfg, args.worker_id,
+                              pruning=not replicate)
 
-    objective = make_objective(args.model, cfg, loaders, num_features, device, args.epochs)
-    study.optimize(objective, n_trials=args.n_trials)
+    n_trials = args.n_trials
+    if replicate:
+        source = optuna.load_study(study_name=args.replicate_from,
+                                   storage=_storage(args.replicate_from))
+        _enqueue_replicates(study, source, args.top, args.seeds)
+        n_trials = sum(t.state == optuna.trial.TrialState.WAITING
+                       for t in study.trials)
+        logger.info("Replicates queued: %d", n_trials)
+
+    def _stop_when_queue_empty(study: optuna.Study, _trial) -> None:
+        if replicate and not any(t.state == optuna.trial.TrialState.WAITING
+                                 for t in study.trials):
+            study.stop()
+
+    objective = make_objective(args.model, cfg, loaders, num_features, device,
+                               args.epochs, replicate=replicate)
+    if n_trials > 0:
+        study.optimize(objective, n_trials=n_trials,
+                       callbacks=[_stop_when_queue_empty])
 
     logger.info("Best val score: %.6g", study.best_value)
     logger.info("Best params: %s", study.best_params)

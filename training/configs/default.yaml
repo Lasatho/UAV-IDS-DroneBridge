@@ -50,6 +50,9 @@ model:
     kl_dyn_beta: 0.5
     kl_rep_beta: 0.1
     free_nats: 1.0
+    # Prior prediction error of the first steps of a window is excluded
+    # from the anomaly score (state starts at zero; 4 steps = 1 s at 4 Hz).
+    score_burn_in: 4
 
   mts_jepa:
     patch_length: 4
@@ -73,7 +76,7 @@ training:
   lr: 1.0e-3
   weight_decay: 1.0e-5
   scheduler: "cosine"       # cosine | step | none
-  warmup_epochs: 5
+  warmup_epochs: 1          # 1 epoch = ~13.7k steps at batch_size 64
   grad_clip_norm: 1.0
   early_stopping_patience: 15
 
