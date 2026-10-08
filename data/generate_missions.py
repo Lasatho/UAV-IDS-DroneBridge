@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
 """
-Waypoint Generator for IDS Normal-Flight Dataset v1
-Full Factorial Design over all parameter dimensions.
+Waypoint Generator for IDS Normal-Flight Dataset v2
+
+Design: every geometry x drone preset x wind profile (16 cells per
+geometry), one flight per cell. The wind direction is not crossed but
+rotated (Latin square): direction index = (geometry + preset + wind) mod 4,
+so each direction occurs 4x per geometry and equally often with every
+preset and wind profile.
+
+Changes from v1 (full factorial geometry x preset x wind x direction,
+10752 missions): v1 presets used parameter names that ArduCopter 4.8 no
+longer has (WPNAV_*, RTL_ALT; silently ignored), wind was not applied by the
+orchestrator at the time, and NAV_LOITER_TIME ignores radius and direction,
+so v1 flights of one geometry were the same trajectory. v2 uses the
+ArduCopter 4.8 parameter names (SI units) and only the loiter variants
+that actually differ.
 
 Generates:
   - .waypoints files (QGC WPL 110 format) for ArduPilot SITL
   - missions_manifest.csv with all parameter combinations
   - meta/<mission_id>_params.json per mission
 
-Profiles: Rectangle, Figure-8, Star, Zigzag Climb/Descent, Loiter Circles
+Profiles: Rectangle, Figure-8, Star, Zigzag Climb/Descent, Loiter (hold)
 Drone Presets: Conservative, Standard, Dynamic, Fast
 Wind Profiles: Calm, Light, Moderate, Gusty
 Wind Directions: N, NE, E, SE (0°, 45°, 90°, 135°)
@@ -16,6 +29,9 @@ Wind Directions: N, NE, E, SE (0°, 45°, 90°, 135°)
 Usage:
     python3 generate_missions.py --output-dir ./dataset
     python3 generate_missions.py --output-dir ./dataset --dry-run  # only print count
+
+Mission ids start at --id-offset + 1 (default 30001) so v1 files
+(mission_00001..10752) and the attack set (mission_2xxxx) stay untouched.
 """
 
 import argparse
@@ -360,46 +376,50 @@ ZIGZAG_PARAMS = list(product(
     [(15, 60), (30, 100), (15, 120)],  # alt_band (low, high)
 ))
 
+# NAV_LOITER_TIME in ArduCopter holds position: radius and direction are
+# ignored (v1: identical flights for radius 0/20/50 and CW/CCW). Only the
+# variants that differ are kept.
 LOITER_PARAMS = list(product(
-    [0, 20, 50],            # loiter_radius (0 = hover)
+    [0],                    # loiter_radius (hover)
     [60, 120, 180],         # loiter_time_s
     [15, 30, 60],           # alt
-    [1, -1],                # direction (CW, CCW)
+    [1],                    # direction (no effect, see above)
 ))
 
-# Drone presets
+# Drone presets — ArduCopter 4.8 parameter names, SI units (m/s, m).
+# Same values as v1 (which used WPNAV_SPEED etc. in cm/s and cm).
 DRONE_PRESETS = {
     "conservative": {
-        "WPNAV_SPEED": 300,
-        "WPNAV_SPEED_UP": 150,
-        "WPNAV_SPEED_DN": 100,
-        "WPNAV_LOIT_SPEED": 250,
-        "WPNAV_RADIUS": 200,
-        "RTL_ALT": 3000,
+        "WP_SPD": 3.0,
+        "WP_SPD_UP": 1.5,
+        "WP_SPD_DN": 1.0,
+        "LOIT_SPEED_MS": 2.5,
+        "WP_RADIUS_M": 2.0,
+        "RTL_ALT_M": 30.0,
     },
     "standard": {
-        "WPNAV_SPEED": 500,
-        "WPNAV_SPEED_UP": 250,
-        "WPNAV_SPEED_DN": 150,
-        "WPNAV_LOIT_SPEED": 500,
-        "WPNAV_RADIUS": 200,
-        "RTL_ALT": 3000,
+        "WP_SPD": 5.0,
+        "WP_SPD_UP": 2.5,
+        "WP_SPD_DN": 1.5,
+        "LOIT_SPEED_MS": 5.0,
+        "WP_RADIUS_M": 2.0,
+        "RTL_ALT_M": 30.0,
     },
     "dynamic": {
-        "WPNAV_SPEED": 1000,
-        "WPNAV_SPEED_UP": 350,
-        "WPNAV_SPEED_DN": 250,
-        "WPNAV_LOIT_SPEED": 750,
-        "WPNAV_RADIUS": 100,
-        "RTL_ALT": 3000,
+        "WP_SPD": 10.0,
+        "WP_SPD_UP": 3.5,
+        "WP_SPD_DN": 2.5,
+        "LOIT_SPEED_MS": 7.5,
+        "WP_RADIUS_M": 1.0,
+        "RTL_ALT_M": 30.0,
     },
     "fast": {
-        "WPNAV_SPEED": 1200,
-        "WPNAV_SPEED_UP": 350,
-        "WPNAV_SPEED_DN": 250,
-        "WPNAV_LOIT_SPEED": 750,
-        "WPNAV_RADIUS": 500,
-        "RTL_ALT": 6000,
+        "WP_SPD": 12.0,
+        "WP_SPD_UP": 3.5,
+        "WP_SPD_DN": 2.5,
+        "LOIT_SPEED_MS": 7.5,
+        "WP_RADIUS_M": 5.0,
+        "RTL_ALT_M": 60.0,
     },
 }
 
@@ -495,15 +515,18 @@ PROFILES = {
 
 def enumerate_all_missions():
     """
-    Full factorial: profile × geometry × drone_preset × wind_profile × wind_direction.
+    profile × geometry × drone_preset × wind_profile, wind direction rotated
+    (Latin square over geometry, preset and wind profile, see module doc).
     Yields (profile, geometry_params, drone_preset_name, wind_profile_name, wind_direction).
     """
+    geo_idx = 0
     for profile_name, geo_variants in PROFILES.items():
         for geo_params in geo_variants:
-            for preset_name in DRONE_PRESETS:
-                for wind_name in WIND_PROFILES:
-                    for wind_dir in WIND_DIRECTIONS:
-                        yield (profile_name, geo_params, preset_name, wind_name, wind_dir)
+            for p_idx, preset_name in enumerate(DRONE_PRESETS):
+                for w_idx, wind_name in enumerate(WIND_PROFILES):
+                    wind_dir = WIND_DIRECTIONS[(geo_idx + p_idx + w_idx) % len(WIND_DIRECTIONS)]
+                    yield (profile_name, geo_params, preset_name, wind_name, wind_dir)
+            geo_idx += 1
 
 
 # ---------------------------------------------------------------------------
@@ -511,11 +534,14 @@ def enumerate_all_missions():
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate IDS Normal-Flight Dataset v1")
+    parser = argparse.ArgumentParser(description="Generate IDS Normal-Flight Dataset v2")
     parser.add_argument("--output-dir", type=str, default="./dataset",
                         help="Root output directory")
     parser.add_argument("--dry-run", action="store_true",
                         help="Only count missions, don't write files")
+    parser.add_argument("--id-offset", type=int, default=30000,
+                        help="Mission ids start at offset + 1")
+    parser.add_argument("--manifest-name", default="missions_manifest_v2.csv")
     args = parser.parse_args()
 
     # Count per profile
@@ -523,15 +549,15 @@ def main():
     total_geo = 0
     for pname, gvariants in PROFILES.items():
         n_geo = len(gvariants)
-        n_full = n_geo * len(DRONE_PRESETS) * len(WIND_PROFILES) * len(WIND_DIRECTIONS)
+        n_full = n_geo * len(DRONE_PRESETS) * len(WIND_PROFILES)
         print(f"  {pname:12s}: {n_geo:4d} geometries × "
-              f"{len(DRONE_PRESETS)} presets × {len(WIND_PROFILES)} wind × "
-              f"{len(WIND_DIRECTIONS)} dirs = {n_full:6d} missions")
+              f"{len(DRONE_PRESETS)} presets × {len(WIND_PROFILES)} wind "
+              f"(direction rotated) = {n_full:6d} missions")
         total_geo += n_geo
 
-    total = total_geo * len(DRONE_PRESETS) * len(WIND_PROFILES) * len(WIND_DIRECTIONS)
+    total = total_geo * len(DRONE_PRESETS) * len(WIND_PROFILES)
     print(f"\n  Total geometries: {total_geo}")
-    print(f"  Total missions (full factorial): {total}")
+    print(f"  Total missions: {total}")
 
     if args.dry_run:
         sys.exit(0)
@@ -545,7 +571,7 @@ def main():
     (out / "meta").mkdir(exist_ok=True)
 
     # Generate all missions
-    manifest_path = out / "missions_manifest.csv"
+    manifest_path = out / args.manifest_name
     manifest_fields = [
         "mission_id", "profile", "geometry_params", "drone_preset",
         "wind_profile", "wind_direction_deg", "wind_speed_min", "wind_speed_max",
@@ -562,7 +588,7 @@ def main():
         for mission_idx, (profile, geo, preset, wind, wind_dir) in enumerate(
             enumerate_all_missions(), start=1
         ):
-            mission_id = f"mission_{mission_idx:05d}"
+            mission_id = f"mission_{args.id_offset + mission_idx:05d}"
             wp_filename = f"{mission_id}.waypoints"
             wp_path = out / "waypoints" / wp_filename
 
@@ -588,7 +614,6 @@ def main():
                 "validation": reason,
                 "status": "pending" if valid else "invalid",
             }
-            writer.writeheader() if mission_idx == 1 else None
             writer.writerow(row)
 
             if valid:
