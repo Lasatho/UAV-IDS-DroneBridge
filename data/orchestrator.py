@@ -78,7 +78,7 @@ CRASHED_RUNS_DIR = "_crashed_runs"
 # aborted before arming, moved to DEGRADED_RUNS_DIR, a gazebo restart is
 # requested via the pause flag and the mission is flown once more.
 GROUND_RTF_MIN = 0.6
-GROUND_RTF_MIN_WALL_S = 3.0
+GROUND_RTF_MIN_WALL_S = 2.0
 DEGRADED_RUNS_DIR = "_degraded_runs"
 
 
@@ -917,6 +917,9 @@ class Orchestrator:
                 return
         log.info(f"[+] SITL rebooted, heartbeat OK "
                  f"(sys {self.conn.target_system}:{self.conn.target_component}).")
+        # Start of the ground-phase timing (a healthy GPS wait and upload
+        # alone take only ~1 s, too short to measure)
+        self._ground_clock0 = self.sim_clock()
 
     def verify_armed(self, timeout=10):
         """Check heartbeat to verify armed state."""
@@ -994,7 +997,8 @@ class Orchestrator:
 
         try:
             self.zero_wind()
-            clock0 = self.sim_clock()
+            clock0 = getattr(self, "_ground_clock0", None) or self.sim_clock()
+            self._ground_clock0 = None
             ready = self.wait_for_ready()
             if ready:
                 self.wait_ekf_ready(timeout=30)
