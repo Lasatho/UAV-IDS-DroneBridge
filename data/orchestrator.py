@@ -64,6 +64,13 @@ GZ_SPAWN_POSE = ("position: {x: 0, y: 0, z: 0.195}, "
 WIND_TOPIC = f"/world/{GZ_WORLD}/wind"
 WIND_RATE_HZ = 4.0
 
+# A normal flight that crashes (ArduCopter "Crash: Disarming", e.g. tipped
+# over by a gust at touchdown) is no benign data, and with the fixed wind seed
+# every retry crashes the same way. It is flown once more with the seed
+# offset by WIND_RESEED_OFFSET; the crashed run is moved to CRASHED_RUNS_DIR.
+WIND_RESEED_OFFSET = 100000
+CRASHED_RUNS_DIR = "_crashed_runs"
+
 # Between missions the orchestrator holds while this flag exists, so the
 # watchdog can restart gazebo+ardupilot without hitting a pose reset or SITL
 # reboot. After the flag is removed the SITL is rebooted again.
@@ -387,14 +394,15 @@ class Orchestrator:
             time.sleep(1 / WIND_RATE_HZ)
 
     def start_wind(self, mission_id: str, wind_params: dict,
-                   wind_direction_deg: int) -> dict:
+                   wind_direction_deg: int, seed: int = None) -> dict:
         """Start publishing the mission's time-varying wind in a thread.
 
-        Seeded from the mission number (reproducible). The commanded series
-        is written to <output>/wind/<mission_id>_wind.csv.
+        Seeded from the mission number unless a seed is given (reproducible).
+        The commanded series is written to <output>/wind/<mission_id>_wind.csv.
         """
         self._wind_publisher()
-        seed = int(mission_id.split("_")[-1])
+        if seed is None:
+            seed = int(mission_id.split("_")[-1])
         model = WindModel(wind_params, wind_direction_deg, seed)
         path = self.output_dir / "wind" / f"{mission_id}_wind.csv"
         stop = threading.Event()
@@ -764,7 +772,7 @@ class Orchestrator:
                     attack_type: str = "none", attack_start: float = None,
                     attack_end: float = None, waypoints_reached: list = None,
                     mission_success: bool = False, attack_variant: str = None,
-                    flight: dict = None, wind: dict = None):
+                    flight: dict = None, wind: dict = None, notes: str = ""):
         flight = flight or {}
         label = {
             "run_id": run_id,
@@ -785,7 +793,7 @@ class Orchestrator:
             "statustext": flight.get("statustext", []),
             "landed_by_orchestrator": flight.get("landed_by_orchestrator", False),
             "wind": wind,
-            "notes": ""
+            "notes": notes
         }
         label_path = self.output_dir / "phase_labels" / f"{run_id}.json"
         with open(label_path, "w") as f:
@@ -900,8 +908,25 @@ class Orchestrator:
         log.warning("  Vehicle not airborne.")
         return False
 
-    def run_single(self, mission: dict):
+    def archive_crashed_run(self, mission_id: str, seed: int):
+        """Move pcap, telemetry, wind series and label of a crashed run to
+        <output>/_crashed_runs/<mission_id>_seed<seed>/ so the re-flight
+        does not mix with it."""
+        dest = self.output_dir / CRASHED_RUNS_DIR / f"{mission_id}_seed{seed}"
+        dest.mkdir(parents=True, exist_ok=True)
+        files = [self.output_dir / "pcap" / f"{mission_id}.pcap",
+                 self.output_dir / "wind" / f"{mission_id}_wind.csv",
+                 self.output_dir / "phase_labels" / f"{mission_id}.json"]
+        files += sorted((self.output_dir / "telemetry").glob(f"{mission_id}_*.csv"))
+        for p in files:
+            if p.exists():
+                p.rename(dest / p.name)
+        log.info(f"  Crashed run archived -> {dest}")
+
+    def run_single(self, mission: dict, crashed_seeds: list = None):
         mission_id = mission["mission_id"]
+        crashed_seeds = crashed_seeds or []
+        wind_seed = int(mission_id.split("_")[-1]) + WIND_RESEED_OFFSET * len(crashed_seeds)
         log.info(f"=== Starting {mission_id} ({mission['profile']}) ===")
         wp_path = self.output_dir / "waypoints" / mission["waypoint_file"]
 
@@ -955,7 +980,9 @@ class Orchestrator:
             # attack window (attacks fire mid-flight), only the ~12 s takeoff
             # is calm.
             wind = self.start_wind(mission_id, meta["wind_params"],
-                                   meta["wind_direction_deg"])
+                                   meta["wind_direction_deg"], seed=wind_seed)
+            if crashed_seeds:
+                wind["crashed_seeds"] = crashed_seeds
 
             # Now switch to AUTO — mission continues from WP2
             self.set_mode("AUTO")
@@ -1011,6 +1038,10 @@ class Orchestrator:
                 log.error(f"  Could not reset wind: {e}")
             stop_process(tcpdump_proc, "tcpdump")
             stop_process(telemetry_proc, "telemetry logger")
+            notes = ""
+            if crashed_seeds:
+                notes = (f"re-flown with wind seed {wind_seed} after crash "
+                         f"with seed(s) {crashed_seeds}")
             self.write_label(mission_id, start_time, end_time,
                              attack_type=meta.get("attack_type", "none"),
                              attack_start=atk_start,
@@ -1018,7 +1049,7 @@ class Orchestrator:
                              waypoints_reached=sorted(reached_wps),
                              mission_success=success,
                              attack_variant=attack_variant,
-                             flight=flight, wind=wind)
+                             flight=flight, wind=wind, notes=notes)
             # For attack runs a flight that got airborne and actually fired the
             # attack is valid data even if it never completed cleanly — the
             # failsafe/hold/termination is the attack effect, not a sim failure.
@@ -1030,24 +1061,39 @@ class Orchestrator:
             else:
                 run_valid = success
 
-            status = "completed" if run_valid else "failed"
-            self.update_manifest_status(mission_id, status)
-            log.info(f"=== {mission_id} {status} ({end_time - start_time:.1f}s) ===")
-
-            if run_valid:
-                self.consecutive_failures = 0
+            crashed = str(flight.get("disarm_reason") or "").startswith("Crash")
+            reflight = (run_attack_type == "none" and crashed
+                        and not crashed_seeds and self.keep_running)
+            if reflight:
+                # Neither completed nor failed: archive and fly again below
+                log.warning(f"  {mission_id} crashed with wind seed {wind_seed} "
+                            f"— re-flying once with seed "
+                            f"{wind_seed + WIND_RESEED_OFFSET}")
+                self.archive_crashed_run(mission_id, wind_seed)
             else:
-                self.consecutive_failures += 1
-                notify(f"[UAV-IDS] {mission_id} FAILED: "
-                       f"{self.consecutive_failures} consecutive failures")
-                if self.consecutive_failures >= 5:
-                    notify("[UAV-IDS] 5 consecutive failures — stopping orchestrator.")
-                    log.error("5 consecutive failures — stopping.")
-                    self.keep_running = False
-                    (self.output_dir / ".stop_orchestrator").touch()
+                status = "completed" if run_valid else "failed"
+                self.update_manifest_status(mission_id, status)
+                log.info(f"=== {mission_id} {status} ({end_time - start_time:.1f}s) ===")
+
+                if run_valid:
+                    self.consecutive_failures = 0
+                else:
+                    self.consecutive_failures += 1
+                    notify(f"[UAV-IDS] {mission_id} FAILED: "
+                           f"{self.consecutive_failures} consecutive failures")
+                    if self.consecutive_failures >= 5:
+                        notify("[UAV-IDS] 5 consecutive failures — stopping orchestrator.")
+                        log.error("5 consecutive failures — stopping.")
+                        self.keep_running = False
+                        (self.output_dir / ".stop_orchestrator").touch()
 
             if self.keep_running:
                 self.reboot_sitl()
+
+        if reflight and self.keep_running:
+            self.wait_while_paused()
+            if self.keep_running:
+                self.run_single(mission, crashed_seeds=crashed_seeds + [wind_seed])
 
     def wait_while_paused(self):
         """Hold between missions while the watchdog's pause flag exists,
