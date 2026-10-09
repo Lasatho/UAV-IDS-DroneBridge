@@ -10,6 +10,7 @@ Scripts for automated dataset generation. These scripts coordinate the SITL simu
 | `orchestrator.py` | Reads manifest, uploads waypoints to SITL, sets drone params, runs missions, writes status back | Continuous |
 | `telemetry_logger.py` | Captures MAVLink telemetry (RAW_IMU, GPS_RAW_INT, SCALED_PRESSURE, SERVO_OUTPUT_RAW, GLOBAL_POSITION_INT) to per-mission CSVs | Called by orchestrator |
 | `validate_missions.py` | Post-hoc validation: compares recorded telemetry against planned waypoints, checks takeoff/landing/duration/gaps | After flights |
+| `sanity_check_v2.py` | Per-mission sanity check of v2 missions on a simulation host (labels, telemetry gaps, ground-phase RTF, GPS fix, presets, wind, tilt after landing, pcap); stdlib only | During the run |
 
 ## Workflow
 
