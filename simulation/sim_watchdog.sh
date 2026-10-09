@@ -23,7 +23,9 @@
 #         current mission and holds ("Paused"), the watchdog restarts
 #         gazebo + ardupilot and removes the flag, the orchestrator reboots
 #         the SITL and continues. No time limit on the wait (missions run
-#         up to 75 min); a hung mission is caught by check 4.
+#         up to 75 min); a hung mission is caught by check 4. A pause flag
+#         set by the orchestrator (degraded ground phase before takeoff) is
+#         handled the same way.
 #   6. RTF_SAMPLES consecutive sampler entries without an answer from
 #      gazebo (real_time_factor=NA) while it runs -> full restart
 # Full restart: stop orchestrator, restart gazebo, ardupilot, DroneBridge and
@@ -159,7 +161,13 @@ while true; do
     full_restart "orchestrator silent for ${STALL_S}s"; continue
   fi
 
-  # 5. RTF degradation (proactive, cheap restart between missions)
+  # 5. RTF degradation (proactive, cheap restart between missions). The
+  #    orchestrator sets the pause flag itself when it measures a degraded
+  #    ground phase; handle that like a low-RTF pause.
+  if [ -z "$pause_since" ] && [ -f "$PAUSE" ]; then
+    pause_since=$(date -u -d "@$(stat -c %Y "$PAUSE")" +%Y-%m-%dT%H:%M:%SZ)
+    log "pause flag set by orchestrator -> restart gazebo+ardupilot when paused"
+  fi
   if [ -n "$pause_since" ]; then
     if docker logs --since "$pause_since" "$ORCH" 2>&1 | grep -q "Paused (watchdog flag)"; then
       log "orchestrator paused -> restart gazebo+ardupilot"

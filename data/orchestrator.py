@@ -71,6 +71,20 @@ WIND_RATE_HZ = 4.0
 WIND_RESEED_OFFSET = 100000
 CRASHED_RUNS_DIR = "_crashed_runs"
 
+# Gazebo degrades over hours; it shows first in the ground phase before
+# takeoff (sim time runs at a fraction of wall time, telemetry gaps, no GPS
+# fix), long before the watchdog's 2-min RTF samples see it. The ground phase
+# is timed (vehicle sim clock vs. wall clock); below GROUND_RTF_MIN the run is
+# aborted before arming, moved to DEGRADED_RUNS_DIR, a gazebo restart is
+# requested via the pause flag and the mission is flown once more.
+GROUND_RTF_MIN = 0.6
+GROUND_RTF_MIN_WALL_S = 3.0
+DEGRADED_RUNS_DIR = "_degraded_runs"
+
+
+class SimDegraded(RuntimeError):
+    pass
+
 # Between missions the orchestrator holds while this flag exists, so the
 # watchdog can restart gazebo+ardupilot without hitting a pose reset or SITL
 # reboot. After the flag is removed the SITL is rebooted again.
@@ -188,6 +202,27 @@ class Orchestrator:
                 return True
         log.warning("[?] Timeout waiting for GPS fix.")
         return False
+
+    def sim_clock(self, timeout=30):
+        """(wall time, vehicle sim time) from a fresh GLOBAL_POSITION_INT, or
+        None if none arrives."""
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+        msg = self.conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True,
+                                   timeout=timeout)
+        return (time.time(), msg.time_boot_ms / 1000) if msg else None
+
+    def ground_rtf(self, clock0):
+        """Sim time / wall time since clock0, or None if not measurable."""
+        clock1 = self.sim_clock()
+        if clock0 is None or clock1 is None:
+            return None
+        wall = clock1[0] - clock0[0]
+        if wall < GROUND_RTF_MIN_WALL_S:
+            return None
+        rtf = (clock1[1] - clock0[1]) / wall
+        log.info(f"  Ground phase sim/wall {rtf:.2f} over {wall:.1f} s")
+        return rtf
 
     def arm(self):
         log.info("Arming...")
@@ -908,11 +943,9 @@ class Orchestrator:
         log.warning("  Vehicle not airborne.")
         return False
 
-    def archive_crashed_run(self, mission_id: str, seed: int):
-        """Move pcap, telemetry, wind series and label of a crashed run to
-        <output>/_crashed_runs/<mission_id>_seed<seed>/ so the re-flight
-        does not mix with it."""
-        dest = self.output_dir / CRASHED_RUNS_DIR / f"{mission_id}_seed{seed}"
+    def archive_run(self, mission_id: str, dest: Path):
+        """Move pcap, telemetry, wind series and label of a run to dest so
+        the re-flight does not mix with it."""
         dest.mkdir(parents=True, exist_ok=True)
         files = [self.output_dir / "pcap" / f"{mission_id}.pcap",
                  self.output_dir / "wind" / f"{mission_id}_wind.csv",
@@ -921,9 +954,16 @@ class Orchestrator:
         for p in files:
             if p.exists():
                 p.rename(dest / p.name)
-        log.info(f"  Crashed run archived -> {dest}")
+        log.info(f"  Run archived -> {dest}")
 
-    def run_single(self, mission: dict, crashed_seeds: list = None):
+    def request_sim_restart(self):
+        """Set the pause flag: the watchdog restarts gazebo + ardupilot once
+        the orchestrator holds in wait_while_paused()."""
+        (self.output_dir / PAUSE_FLAG).touch()
+        log.warning("  Requested gazebo/ardupilot restart (pause flag)")
+
+    def run_single(self, mission: dict, crashed_seeds: list = None,
+                   degraded_retry: bool = False):
         mission_id = mission["mission_id"]
         crashed_seeds = crashed_seeds or []
         wind_seed = int(mission_id.split("_")[-1]) + WIND_RESEED_OFFSET * len(crashed_seeds)
@@ -950,16 +990,24 @@ class Orchestrator:
         flight = {}
         wind = None
         attack_variant = meta.get("attack_variant")
+        degraded = False
 
         try:
             self.zero_wind()
-            if not self.wait_for_ready():
-                raise RuntimeError("No GPS fix")
-            self.wait_ekf_ready(timeout=30)
+            clock0 = self.sim_clock()
+            ready = self.wait_for_ready()
+            if ready:
+                self.wait_ekf_ready(timeout=30)
 
-            # Set params and upload AFTER SITL is ready
-            self.set_params(meta["drone_params"])
-            self.upload_mission(wp_path)
+                # Set params and upload AFTER SITL is ready
+                self.set_params(meta["drone_params"])
+                self.upload_mission(wp_path)
+
+            rtf = self.ground_rtf(clock0)
+            if rtf is not None and rtf < GROUND_RTF_MIN:
+                raise SimDegraded(f"ground phase sim/wall {rtf:.2f} < {GROUND_RTF_MIN}")
+            if not ready:
+                raise RuntimeError("No GPS fix")
 
             self.set_mode("GUIDED")
             if not self.arm():
@@ -1028,6 +1076,9 @@ class Orchestrator:
 
             if not success:
                 log.warning(f"  Mission {mission_id} did not complete cleanly")
+        except SimDegraded as e:
+            degraded = True
+            log.error(f"Run {mission_id} aborted, simulation degraded: {e}")
         except Exception as e:
             log.error(f"Run {mission_id} failed: {e}")
         finally:
@@ -1042,6 +1093,8 @@ class Orchestrator:
             if crashed_seeds:
                 notes = (f"re-flown with wind seed {wind_seed} after crash "
                          f"with seed(s) {crashed_seeds}")
+            if degraded_retry:
+                notes = "; ".join(filter(None, [notes, "re-flown after degraded simulation"]))
             self.write_label(mission_id, start_time, end_time,
                              attack_type=meta.get("attack_type", "none"),
                              attack_start=atk_start,
@@ -1064,12 +1117,21 @@ class Orchestrator:
             crashed = str(flight.get("disarm_reason") or "").startswith("Crash")
             reflight = (run_attack_type == "none" and crashed
                         and not crashed_seeds and self.keep_running)
-            if reflight:
+            if degraded:
+                self.request_sim_restart()
+            redo = degraded and not degraded_retry and self.keep_running
+            if redo:
+                # Neither completed nor failed: archive, gazebo restart, fly again below
+                log.warning(f"  {mission_id} re-flown after the gazebo restart")
+                self.archive_run(mission_id, self.output_dir / DEGRADED_RUNS_DIR
+                                 / f"{mission_id}_{int(start_time)}")
+            elif reflight:
                 # Neither completed nor failed: archive and fly again below
                 log.warning(f"  {mission_id} crashed with wind seed {wind_seed} "
                             f"— re-flying once with seed "
                             f"{wind_seed + WIND_RESEED_OFFSET}")
-                self.archive_crashed_run(mission_id, wind_seed)
+                self.archive_run(mission_id, self.output_dir / CRASHED_RUNS_DIR
+                                 / f"{mission_id}_seed{wind_seed}")
             else:
                 status = "completed" if run_valid else "failed"
                 self.update_manifest_status(mission_id, status)
@@ -1087,13 +1149,20 @@ class Orchestrator:
                         self.keep_running = False
                         (self.output_dir / ".stop_orchestrator").touch()
 
-            if self.keep_running:
+            # After a degraded run the SITL is rebooted on resume instead
+            if self.keep_running and not degraded:
                 self.reboot_sitl()
 
-        if reflight and self.keep_running:
+        if redo:
             self.wait_while_paused()
             if self.keep_running:
-                self.run_single(mission, crashed_seeds=crashed_seeds + [wind_seed])
+                self.run_single(mission, crashed_seeds=crashed_seeds,
+                                degraded_retry=True)
+        elif reflight and self.keep_running:
+            self.wait_while_paused()
+            if self.keep_running:
+                self.run_single(mission, crashed_seeds=crashed_seeds + [wind_seed],
+                                degraded_retry=degraded_retry)
 
     def wait_while_paused(self):
         """Hold between missions while the watchdog's pause flag exists,
