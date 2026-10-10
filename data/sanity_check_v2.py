@@ -41,7 +41,7 @@ PRESET_SPEED = {"conservative": 3, "standard": 5, "dynamic": 10, "fast": 12}
 RTF_LOG_TZ = timezone(timedelta(hours=2))
 
 MAX_GAP_S = 1.0
-MIN_GROUND_RTF = 0.6      # sim/wall of the ground phase; normal ~0.9-1.0
+MIN_GROUND_RTF = 0.75     # sim/wall of the ground phase; normal ~0.8-1.0
 MAX_START_DIST_M = 5.0
 MAX_TILT_DEG = 15.0
 MIN_RTF = 0.75            # watchdog threshold

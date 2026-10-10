@@ -77,8 +77,13 @@ CRASHED_RUNS_DIR = "_crashed_runs"
 # is timed (vehicle sim clock vs. wall clock); below GROUND_RTF_MIN the run is
 # aborted before arming, moved to DEGRADED_RUNS_DIR, a gazebo restart is
 # requested via the pause flag and the mission is flown once more.
-GROUND_RTF_MIN = 0.6
-GROUND_RTF_MIN_WALL_S = 2.0
+# Healthy ground phases measure 0.81-0.88 (HP) and 0.92-0.99 (TR); at the
+# onset of a degradation runs passed 0.6 with 0.61/0.70 and lost GPS fix.
+# Short windows (~2.7 s, first mission after a gazebo restart) read lower on
+# HP (0.79-0.83) and are not judged; a degraded ground phase stretches the
+# window anyway (all degradations so far >= 8 s).
+GROUND_RTF_MIN = 0.75
+GROUND_RTF_MIN_WALL_S = 4.0
 DEGRADED_RUNS_DIR = "_degraded_runs"
 
 
