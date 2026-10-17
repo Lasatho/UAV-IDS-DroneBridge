@@ -66,7 +66,11 @@
           </noise>
         </magnitude>
         <direction>
-          <time_for_rise>0.25</time_for_rise>
+          <!-- WindEffects low-passes the atan2 angle without unwrapping; a
+               filter crossing the +-180 deg seam (air flowing to -x, wind
+               from 90 deg) turns the wind around once per crossing. With
+               time_for_rise = max_step_size the gain is 1 (no filtering). -->
+          <time_for_rise>0.001</time_for_rise>
           <noise type="gaussian">
             <mean>0</mean>
             <stddev>0.03</stddev>

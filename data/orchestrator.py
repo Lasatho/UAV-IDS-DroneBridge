@@ -30,6 +30,7 @@ import threading
 from pymavlink import mavutil
 
 from wind_model import WindModel
+from split_manifest import estimate_s, OVERHEAD_S
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,7 +98,7 @@ PAUSE_FLAG = ".pause_orchestrator"
 
 # WORKAROUND (2026-10-08): with Gazebo wind the landed model keeps being
 # pushed, ArduCopter's land detector never triggers and the vehicle stays
-# armed on the ground until the mission timeout (75 min for normal runs).
+# armed on the ground until the mission timeout.
 # The orchestrator treats the vehicle as landed after LANDED_HOLD_S of
 # relative altitude < LANDED_ALT_M and near-zero velocity (after having been
 # above AIRBORNE_ALT_M), force-disarms it and marks this in the label.
@@ -106,6 +107,33 @@ LANDED_VH_MS = 0.3
 LANDED_VZ_MS = 0.2
 LANDED_HOLD_S = 10.0
 AIRBORNE_ALT_M = 5.0
+
+# Normal-run timeout per mission: flight time of the split_manifest time
+# model (no wind) times the largest actual/model ratio measured for its wind
+# profile and preset on the v2 run (HP and TR, 2026-10-13), times
+# TIMEOUT_MARGIN. A fixed 75 min cut off the long missions in wind
+# (moderate wind slows the fast presets up to 6x against the model).
+TIMEOUT_FACTOR = {
+    "calm":     {"conservative": 0.99, "standard": 0.99, "dynamic": 1.34, "fast": 1.49},
+    "light":    {"conservative": 1.00, "standard": 1.08, "dynamic": 1.60, "fast": 1.80},
+    "gusty":    {"conservative": 1.80, "standard": 2.22, "dynamic": 3.60, "fast": 4.28},
+    "moderate": {"conservative": 2.05, "standard": 3.17, "dynamic": 5.38, "fast": 6.20},
+}
+TIMEOUT_MARGIN = 1.25
+TIMEOUT_MIN_S = 900
+TIMEOUT_FALLBACK_S = 4500   # wind profile or preset not in the table
+
+# While waiting for the mission end the orchestrator logs a progress line
+# every PROGRESS_LOG_S; otherwise a long leg in wind can stay silent longer
+# than the watchdog's STALL_S and trigger a full restart mid-flight.
+PROGRESS_LOG_S = 300
+
+# Gazebo drifts with age: the vehicle starts away from the spawn point
+# although the pose reset reports success, and takeoffs fail from ~8 m on
+# (TR, 2026-10-12/13). Beyond START_OFFSET_MAX_M the run is handled like a
+# degraded ground phase (abort before arming, gazebo restart, fly again).
+SPAWN_LAT, SPAWN_LON = -35.3632621, 149.1652374
+START_OFFSET_MAX_M = 5.0
 
 # Child processes (tcpdump, telemetry logger, attack scripts) get this long
 # to exit after SIGTERM before they are killed.
@@ -216,6 +244,25 @@ class Orchestrator:
         msg = self.conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True,
                                    timeout=timeout)
         return (time.time(), msg.time_boot_ms / 1000) if msg else None
+
+    def start_offset_m(self, timeout=10):
+        """Horizontal distance of the vehicle from the spawn point in m, or
+        None if no position arrives."""
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+        deadline = time.time() + timeout
+        msg = None
+        while time.time() < deadline:
+            m = self.conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True,
+                                     timeout=2.0)
+            if m is not None and m.get_srcSystem() != 0:
+                msg = m
+                break
+        if msg is None:
+            return None
+        dn = (msg.lat / 1e7 - SPAWN_LAT) * 111320.0
+        de = (msg.lon / 1e7 - SPAWN_LON) * 111320.0 * math.cos(math.radians(SPAWN_LAT))
+        return math.hypot(dn, de)
 
     def ground_rtf(self, clock0):
         """Sim time / wall time since clock0, or None if not measurable."""
@@ -350,52 +397,21 @@ class Orchestrator:
             log.warning(f"  Mission upload issue: {ack}")
 
     def estimate_mission_timeout(self, wp_path: Path, meta: dict) -> int:
-        """Fixed timeout: 10 min for attack runs (failsafe/hold is the
-        expected attack effect), 75 min for normal missions (longest v2
-        mission, conservative preset at 3 m/s, is estimated at ~60 min)."""
+        """10 min for attack runs (failsafe/hold is the expected attack
+        effect); for normal runs the modelled flight time scaled by the
+        measured wind/preset factor (see TIMEOUT_FACTOR)."""
         if meta.get("attack_type", "none") != "none":
             return 600
-        return 4500
-        # """Estimate max mission duration from actualy waypoint distances"""
-        # wps = []
-        # with open(wp_path, "r") as f:
-        #     f.readline()    # skip header
-        #     for line in f:
-        #         parts = line.strip().split("\t")
-        #         if len(parts) < 12:
-        #             continue
-        #     cmd = int(parts[3])
-        #     if cmd in (16,22):
-        #         lat = float(parts[8])
-        #         lon = float(parts[9])
-        #         alt = float(parts[10])
-        #         if lat != 0.0 or lon != 0.0:
-        #             wps.append((lat, lon, alt))
-
-        # # calculate total distance between consecutive waypoints
-        # total_dist = 0.0
-        # R = 6378137.0
-        # for i in range(1, len(wps)):
-        #     dlat = math.radians(wps[i][0] - wps[i-1][0])
-        #     dlon = math.radians(wps[i][1] - wps[i-1][1])
-        #     a = (math.sin(dlat/2)**2 + math.cos(math.radians(wps[i-1][0])) * math.cos(math.radians(wps[i][0])) * math.sin(dlon/2)**2)
-        #     total_dist += R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-
-        # speed_cms = meta["drone_params"].get("WPNAV_SPEED", 500)
-        # speed_ms = speed_cms / 100.0
-
-        # # RTL overhead
-        # rtl_alt_cm = meta["drone_params"].get("RTL_ALT", 3000)
-        # speed_up_cms = meta["drone_params"].get("WPNAV_SPEED_UP", 250)
-        # speed_dn_cms = meta["drone_params"].get("WPNAV_SPEED_DN", 150)
-        # rtl_overhead_s= (rtl_alt_cm  / speed_up_cms) + (rtl_alt_cm / speed_dn_cms) + 60
-
-        # flight_s = total_dist / max(speed_ms, 1.0)
-        # estimated_s = flight_s + rtl_overhead_s
-        # timeout = max(300, int(estimated_s * 2.5))
-        # log.info(f"  Mission timeout: {timeout}s (flight={flight_s:.0f}s, "
-        #          f"dist={total_dist:.0f}m, rtl={rtl_overhead_s:.0f}s, {speed_ms:.1f} m/s)")
-        # return timeout
+        factor = TIMEOUT_FACTOR.get(meta.get("wind_profile"), {}).get(
+            meta.get("drone_preset"))
+        if factor is None:
+            log.info(f"  Mission timeout: {TIMEOUT_FALLBACK_S}s (no factor)")
+            return TIMEOUT_FALLBACK_S
+        model_s = estimate_s(wp_path, meta["drone_params"]) - OVERHEAD_S
+        timeout = max(TIMEOUT_MIN_S, int(model_s * factor * TIMEOUT_MARGIN))
+        log.info(f"  Mission timeout: {timeout}s (model {model_s:.0f}s x "
+                 f"{factor} x {TIMEOUT_MARGIN})")
+        return timeout
 
     def _wind_publisher(self):
         """Lazily advertise the WindEffects topic (gz-transport, in-process).
@@ -495,14 +511,35 @@ class Orchestrator:
             for row in rows:
                 writer.writerow(row)
 
-    def set_mode(self, mode: str):
+    def set_mode(self, mode: str, attempts: int = 3, timeout: float = 3.0):
+        """Set the flight mode and confirm it via the vehicle heartbeat.
+
+        A single SET_MODE can get lost on the link without any reply from
+        ArduCopter (HP mission_31097/31107: AUTO never applied, the vehicle
+        hovered in GUIDED until the mission timeout), so resend until the
+        heartbeat reports the mode.
+        """
         mode_id = self.conn.mode_mapping()[mode]
-        self.conn.mav.set_mode_send(
-            self.conn.target_system,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            mode_id
-        )
-        log.info(f"[+] Mode set to {mode}")
+        for attempt in range(1, attempts + 1):
+            self.conn.mav.set_mode_send(
+                self.conn.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_id
+            )
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                msg = self.conn.recv_match(type="HEARTBEAT", blocking=True,
+                                           timeout=1.0)
+                if (msg is not None
+                        and msg.get_srcSystem() == self.conn.target_system
+                        and msg.get_srcComponent() == self.conn.target_component
+                        and msg.custom_mode == mode_id):
+                    log.info(f"[+] Mode set to {mode}"
+                             + (f" (attempt {attempt})" if attempt > 1 else ""))
+                    return
+            log.warning(f"  Mode {mode} not confirmed by heartbeat "
+                        f"(attempt {attempt}/{attempts})")
+        raise RuntimeError(f"Mode {mode} not accepted")
 
     def takeoff(self, alt: float):
         log.info(f"[+] Taking off to {alt}m...")
@@ -626,7 +663,8 @@ class Orchestrator:
         then ends once the flight is over, or at the timeout.
 
         Returns a dict with mission_complete (the last mission item was
-        reached or "Mission Complete" seen; a disarm alone does not count),
+        reached, "Mission Complete" seen, or the vehicle landed and disarmed
+        after the last navigation item; a disarm alone does not count),
         reached waypoints, attack start/end, disarm time/reason, flight mode
         changes and all STATUSTEXTs.
 
@@ -638,6 +676,8 @@ class Orchestrator:
         min_flight_time = time.time() + 60
         reached = set()
         first_wp_time = None
+        next_progress = time.time() + PROGRESS_LOG_S
+        last_pos = None
 
         # Flight state
         mission_complete = False
@@ -718,6 +758,14 @@ class Orchestrator:
                 log.info(f"  [!] Attack {attack_type} STOPPED after "
                          f"{attack_duration:.0f}s")
 
+            if time.time() >= next_progress:
+                next_progress += PROGRESS_LOG_S
+                pos = (f"alt {last_pos.relative_alt / 1000:.1f} m, "
+                       f"{math.hypot(last_pos.vx, last_pos.vy) / 100:.1f} m/s"
+                       if last_pos is not None else "no position")
+                log.info(f"  Progress: {deadline - time.time():.0f}s to timeout, "
+                         f"WPs reached {len(reached)}, mode {mode}, {pos}")
+
             if msg is not None:
                 mtype = msg.get_type()
                 now = time.time()
@@ -748,6 +796,8 @@ class Orchestrator:
                         disarm_reason = text
 
                 elif mtype == "GLOBAL_POSITION_INT":
+                    if msg.get_srcSystem() != 0:
+                        last_pos = msg
                     if msg.get_srcSystem() == 0:
                         pass
                     elif msg.relative_alt / 1000.0 > AIRBORNE_ALT_M:
@@ -793,6 +843,20 @@ class Orchestrator:
                             disarm_time = now
                             log.info(f"  Vehicle disarmed. "
                                      f"WPs reached: {len(reached)}")
+
+            # ArduCopter can auto-disarm after the RTL landing before the
+            # land detection above fires and without reporting the RTL item
+            # as reached (mission_30837): a non-crash disarm on the ground
+            # after the last navigation item completes the mission as well.
+            if (not mission_complete and disarm_time is not None
+                    and was_airborne and last_pos is not None
+                    and last_pos.relative_alt / 1000.0 < LANDED_ALT_M
+                    and not str(disarm_reason or "").startswith("Crash")
+                    and last_seq > 0 and reached
+                    and max(reached) >= last_seq - 1):
+                mission_complete = True
+                log.info("  Disarmed on the ground after the last navigation "
+                         "item — mission complete")
 
             if run_done():
                 log.info(f"  Run done (mission_complete={mission_complete}, "
@@ -1016,7 +1080,17 @@ class Orchestrator:
             if rtf is not None and rtf < GROUND_RTF_MIN:
                 raise SimDegraded(f"ground phase sim/wall {rtf:.2f} < {GROUND_RTF_MIN}")
             if not ready:
+                # A nearly stalled sim may send no GLOBAL_POSITION_INT within
+                # sim_clock's timeout, so the ground phase is not measurable;
+                # treat it as degraded too (HP mission_30626, 2026-10-14).
+                if rtf is None:
+                    raise SimDegraded("no GPS fix, ground phase not measurable")
                 raise RuntimeError("No GPS fix")
+            offset = self.start_offset_m()
+            if offset is not None:
+                log.info(f"  Start offset from spawn point {offset:.1f} m")
+                if offset > START_OFFSET_MAX_M:
+                    raise SimDegraded(f"start offset {offset:.1f} m > {START_OFFSET_MAX_M} m")
 
             self.set_mode("GUIDED")
             if not self.arm():
