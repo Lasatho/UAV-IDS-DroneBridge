@@ -32,13 +32,25 @@ services:
     container_name: uav_ids_db_gcs
     privileged: true
     network_mode: host
-    command: >
-      /opt/dronebridge/db_proxy
-      -n wlan1
-      -m m
-      -c 200
-      -p 5750
-      -d 1
+    # db_proxy crashes (SIGSEGV) on the random frames of rf_jamming. The
+    # crash is part of the attack effect, but restarting the whole container
+    # ~20 times in a row kept dockerd busy on ~7 cores for ~3 min and slowed
+    # the lockstep simulation to RTF ~0.8 (attack dataset Befund 31). The
+    # process is therefore restarted inside the container, after 1 s like
+    # the observed container restarts; Docker only restarts the container if
+    # the loop itself dies.
+    command:
+      - sh
+      - -c
+      - |
+        trap 'kill $$child 2>/dev/null; exit 0' TERM INT
+        while :; do
+          /opt/dronebridge/db_proxy -n wlan1 -m m -c 200 -p 5750 -d 1 &
+          child=$$!
+          wait $$child
+          echo "[supervisor] db_proxy exited with $$?, restarting in 1 s"
+          sleep 1
+        done
     depends_on:
       - ardupilot
     restart: unless-stopped
@@ -50,13 +62,25 @@ services:
     container_name: uav_ids_db_uav
     privileged: true
     network_mode: host
-    command: >
-      /opt/dronebridge/db_proxy
-      -n wlan0
-      -m m
-      -c 200
-      -p 5751
-      -d 3
+    # db_proxy crashes (SIGSEGV) on the random frames of rf_jamming. The
+    # crash is part of the attack effect, but restarting the whole container
+    # ~20 times in a row kept dockerd busy on ~7 cores for ~3 min and slowed
+    # the lockstep simulation to RTF ~0.8 (attack dataset Befund 31). The
+    # process is therefore restarted inside the container, after 1 s like
+    # the observed container restarts; Docker only restarts the container if
+    # the loop itself dies.
+    command:
+      - sh
+      - -c
+      - |
+        trap 'kill $$child 2>/dev/null; exit 0' TERM INT
+        while :; do
+          /opt/dronebridge/db_proxy -n wlan0 -m m -c 200 -p 5751 -d 3 &
+          child=$$!
+          wait $$child
+          echo "[supervisor] db_proxy exited with $$?, restarting in 1 s"
+          sleep 1
+        done
     depends_on:
       - ardupilot
     restart: unless-stopped
