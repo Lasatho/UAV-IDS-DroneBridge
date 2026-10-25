@@ -13,7 +13,8 @@ Frame layout:
   Byte  28:    Port (1=Control, 2=Telemetry, 3=Video, 4=Comms, 5=Status, 6=Proxy, 7=RC)
   Bytes 29-30: Payload Length (uint16 LE)
   Byte  31:    Sequence Number (0-255)
-  Bytes 32+:   Payload (AES+EAX encrypted)
+  Bytes 32+:   Payload (cleartext MAVLink on port 1; the companion computer
+               variant has no transport encryption)
 
 Output CSV columns:
   host_timestamp_ns, timestamp_s, frame_len, direction, comm_id, port,
