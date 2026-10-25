@@ -28,7 +28,16 @@ MESSAGE_FEATURES: dict[str, list[str]] = {
         "servo1_raw", "servo2_raw", "servo3_raw", "servo4_raw",
         "servo5_raw", "servo6_raw", "servo7_raw", "servo8_raw",
     ],
+    # DroneBridge radio frames from the pcap capture, one row per frame
+    # with the raw header fields (data/pcap_to_csv.py). Treated exactly like
+    # a telemetry message type; the file lives in the network directory.
+    "network": [
+        "frame_len", "direction", "comm_id", "port", "payload_len", "seq_num",
+    ],
 }
+
+# Message types read from the network directory instead of the telemetry one
+NETWORK_TYPES = {"network"}
 
 # Timestamp columns to drop per message type (not used as features)
 TIMESTAMP_FIELDS: dict[str, list[str]] = {
@@ -37,6 +46,7 @@ TIMESTAMP_FIELDS: dict[str, list[str]] = {
     "RAW_IMU": ["time_usec"],
     "SCALED_PRESSURE": ["time_boot_ms"],
     "SERVO_OUTPUT_RAW": ["time_usec"],
+    "network": [],  # host clock only
 }
 
 

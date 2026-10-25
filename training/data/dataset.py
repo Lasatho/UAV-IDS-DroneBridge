@@ -73,6 +73,7 @@ def load_mission_cached(
     mission_id: str,
     resample_freq_hz: float,
     enabled_messages: dict[str, bool] | None,
+    network_dir: Path | None = None,
 ) -> np.ndarray:
     """Aligned feature array (T, n_features) for one mission, via .npy cache."""
     cache_path = cache_dir / f"{mission_id}.npy"
@@ -84,6 +85,7 @@ def load_mission_cached(
         mission_id,
         resample_freq_hz=resample_freq_hz,
         enabled_messages=enabled_messages,
+        network_dir=network_dir,
     )
     arr = df.drop(columns=["t_ns"]).to_numpy(dtype=np.float32)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -142,7 +144,7 @@ class TelemetryWindowDataset(Dataset):
 def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normalizer]:
     """Construct train/val/test datasets from the data config section.
 
-    Expects keys: dataset_dir, telemetry_dir, resample_freq_hz,
+    Expects keys: dataset_dir, telemetry_dir, network_dir, resample_freq_hz,
     window_length, window_stride, split_ratios, split_seed, features,
     plus optional max_missions (debug subsampling).
 
@@ -157,6 +159,7 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
     """
     dataset_dir = Path(cfg["dataset_dir"])
     telemetry_dir = Path(cfg["telemetry_dir"])
+    network_dir = Path(cfg["network_dir"]) if cfg.get("network_dir") else None
     enabled = cfg.get("features")
     feature_cols = get_feature_columns(enabled)
     freq = float(cfg["resample_freq_hz"])
@@ -187,7 +190,7 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
             telemetry_dir, n_missions, cache_dir,
         )
     else:
-        mission_ids = discover_missions(telemetry_dir)
+        mission_ids = discover_missions(telemetry_dir, network_dir, enabled)
         if not mission_ids:
             raise RuntimeError(f"No complete missions found in {telemetry_dir}")
 
@@ -210,7 +213,8 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
         for mid in ids:
             try:
                 arrs.append(
-                    load_mission_cached(telemetry_dir, cache_dir, mid, freq, enabled)
+                    load_mission_cached(telemetry_dir, cache_dir, mid, freq,
+                                        enabled, network_dir)
                 )
                 used.append(mid)
             except (ValueError, FileNotFoundError) as e:

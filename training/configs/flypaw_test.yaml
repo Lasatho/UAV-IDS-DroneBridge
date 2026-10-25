@@ -36,6 +36,7 @@ data:
     RAW_IMU: false
     SCALED_PRESSURE: false
     SERVO_OUTPUT_RAW: false
+    network: false  # no radio capture in FlyPaw
 
   batch_size: 8
   num_workers: 0

@@ -32,6 +32,7 @@ import pandas as pd
 
 from .features import (
     MESSAGE_FEATURES,
+    NETWORK_TYPES,
     TIMESTAMP_COL,
     TIMESTAMP_FIELDS,
     get_feature_columns,
@@ -44,11 +45,17 @@ logger = logging.getLogger(__name__)
 # Mission discovery
 # ---------------------------------------------------------------------------
 
-def discover_missions(telemetry_dir: str | Path) -> list[str]:
+def discover_missions(
+    telemetry_dir: str | Path,
+    network_dir: str | Path | None = None,
+    enabled_messages: dict[str, bool] | None = None,
+) -> list[str]:
     """Return sorted mission IDs that have all required telemetry CSVs.
 
-    A mission is complete iff every message type in MESSAGE_FEATURES has
-    a file `{mission_id}_{MSG_TYPE}.csv` in telemetry_dir.
+    A mission is complete iff every telemetry message type in
+    MESSAGE_FEATURES has a file `{mission_id}_{MSG_TYPE}.csv` in
+    telemetry_dir and, if the network stream is enabled, network_dir holds
+    `{mission_id}_network.csv`.
     """
     telemetry_dir = Path(telemetry_dir)
     candidates: dict[str, set[str]] = {}
@@ -61,11 +68,19 @@ def discover_missions(telemetry_dir: str | Path) -> list[str]:
             continue
         mission_id = f"{parts[0]}_{parts[1]}"
         msg_type = parts[2]
-        if msg_type in MESSAGE_FEATURES:
+        if msg_type in MESSAGE_FEATURES and msg_type not in NETWORK_TYPES:
             candidates.setdefault(mission_id, set()).add(msg_type)
 
-    required = set(MESSAGE_FEATURES.keys())
+    required = set(MESSAGE_FEATURES.keys()) - NETWORK_TYPES
     complete = sorted(m for m, types in candidates.items() if types >= required)
+    enabled_net = [t for t in NETWORK_TYPES
+                   if enabled_messages and enabled_messages.get(t, False)]
+    if enabled_net:
+        if network_dir is None:
+            raise ValueError("network stream enabled but no network_dir given")
+        complete = [m for m in complete
+                    if all((Path(network_dir) / f"{m}_{t}.csv").exists()
+                           for t in enabled_net)]
 
     n_incomplete = len(candidates) - len(complete)
     if n_incomplete:
@@ -90,9 +105,10 @@ def _autopilot_time_ns(df: pd.DataFrame, msg_type: str) -> np.ndarray:
     Recordings without an autopilot timestamp (e.g. converted FlyPaw
     data) only carry the host timestamp.
     """
-    field = TIMESTAMP_FIELDS[msg_type][0]
-    if field not in df.columns:
+    fields = TIMESTAMP_FIELDS[msg_type]
+    if not fields or fields[0] not in df.columns:
         return df[TIMESTAMP_COL].to_numpy(dtype=np.int64)
+    field = fields[0]
     scale = 1_000_000 if field.endswith("_ms") else 1_000
     return df[field].to_numpy(dtype=np.int64) * scale
 
@@ -117,6 +133,7 @@ def load_mission(
     mission_id: str,
     resample_freq_hz: float = 4.0,
     enabled_messages: dict[str, bool] | None = None,
+    network_dir: str | Path | None = None,
 ) -> pd.DataFrame:
     """Load one mission and align all message types onto a common time axis.
 
@@ -133,6 +150,8 @@ def load_mission(
             rate of the recordings, otherwise nothing is thinned and the
             native rate is kept.
         enabled_messages: Message-type toggle dict (None = all enabled).
+        network_dir: Directory with `{mission_id}_network.csv`
+            (pcap frames, host_timestamp_ns on the telemetry clock).
 
     Returns:
         DataFrame indexed 0..T-1 with columns
@@ -153,11 +172,12 @@ def load_mission(
     for msg_type, feats in MESSAGE_FEATURES.items():
         if not enabled_messages.get(msg_type, False):
             continue
-        path = telemetry_dir / f"{mission_id}_{msg_type}.csv"
+        src = Path(network_dir) if msg_type in NETWORK_TYPES else telemetry_dir
+        path = src / f"{mission_id}_{msg_type}.csv"
         if not path.exists():
             raise FileNotFoundError(path)
 
-        wanted = {TIMESTAMP_COL, TIMESTAMP_FIELDS[msg_type][0], *feats}
+        wanted = {TIMESTAMP_COL, *TIMESTAMP_FIELDS[msg_type], *feats}
         df = pd.read_csv(path, usecols=lambda c: c in wanted)
         df = df.sort_values(TIMESTAMP_COL).drop_duplicates(
             subset=TIMESTAMP_COL, keep="last"

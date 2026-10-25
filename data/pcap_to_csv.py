@@ -16,16 +16,28 @@ Frame layout:
   Bytes 32+:   Payload (AES+EAX encrypted)
 
 Output CSV columns:
-  timestamp_s, frame_len, direction, comm_id, port, payload_len, seq_num
+  host_timestamp_ns, timestamp_s, frame_len, direction, comm_id, port,
+  payload_len, seq_num
+
+timestamp_s is the capture time (epoch, tcpdump). host_timestamp_ns is the
+same instant on the clock of the telemetry CSVs (time.monotonic_ns() of
+the capture host), so the training pipeline can align the frames like a
+telemetry message type. The two clocks differ by a constant per host and
+boot (dataset/clock_offset_<host>_<date>.json, epoch_minus_monotonic_ns),
+so convert on the host that recorded the pcap, before it reboots.
 
 Usage:
     python3 pcap_to_csv.py --pcap ./dataset/pcap/mission_00028.pcap
     python3 pcap_to_csv.py --pcap ./dataset/pcap/mission_00028.pcap --output ./output.csv
     python3 pcap_to_csv.py --dataset ./dataset                      # batch all pcaps
+    python3 pcap_to_csv.py --dataset ./dataset \
+        --clock-offset ./dataset/clock_offset_HP-BURNER_20261025.json \
+        --manifest ./dataset/missions_manifest_v2_merged.csv --host hp
 """
 
 import argparse
 import csv
+import json
 import struct
 import sys
 from pathlib import Path
@@ -115,12 +127,15 @@ def extract_db_fields(frame_bytes: bytes, orig_len: int):
     }
 
 
-def convert_pcap(pcap_path: Path, output_path: Path):
-    """Convert a single PCAP to CSV."""
+def convert_pcap(pcap_path: Path, output_path: Path, offset_ns: int = None):
+    """Convert a single PCAP to CSV; with offset_ns (epoch - monotonic of
+    the capture host) also write host_timestamp_ns."""
     fieldnames = [
         "timestamp_s", "frame_len", "direction",
         "comm_id", "port", "payload_len", "seq_num"
     ]
+    if offset_ns is not None:
+        fieldnames.insert(0, "host_timestamp_ns")
 
     n_frames = 0
     n_skipped = 0
@@ -136,6 +151,8 @@ def convert_pcap(pcap_path: Path, output_path: Path):
                 continue
 
             fields["timestamp_s"] = f"{timestamp_s:.9f}"
+            if offset_ns is not None:
+                fields["host_timestamp_ns"] = round(timestamp_s * 1e9) - offset_ns
             writer.writerow(fields)
             n_frames += 1
 
@@ -152,13 +169,22 @@ def main():
                         help="Output CSV path (default: <pcap_name>.csv)")
     parser.add_argument("--dataset", type=Path, default=None,
                         help="Dataset root — batch convert all pcaps in dataset/pcap/")
+    parser.add_argument("--clock-offset", type=Path, default=None,
+                        help="clock_offset JSON of the capture host -> host_timestamp_ns")
+    parser.add_argument("--manifest", type=Path, default=None,
+                        help="batch: only missions of this manifest (completed)")
+    parser.add_argument("--host", default=None,
+                        help="batch with --manifest: only rows with this host column")
     args = parser.parse_args()
+    offset_ns = None
+    if args.clock_offset:
+        offset_ns = int(json.loads(args.clock_offset.read_text())["epoch_minus_monotonic_ns"])
 
     if args.pcap:
         # Single file mode
         output = args.output or args.pcap.with_suffix(".csv")
         print(f"Converting {args.pcap.name}...")
-        n_frames, n_skipped = convert_pcap(args.pcap, output)
+        n_frames, n_skipped = convert_pcap(args.pcap, output, offset_ns)
         print(f"  {n_frames} frames extracted, {n_skipped} skipped")
         print(f"  Output: {output}")
 
@@ -169,6 +195,12 @@ def main():
         network_dir.mkdir(exist_ok=True)
 
         pcaps = sorted(pcap_dir.glob("*.pcap"))
+        if args.manifest:
+            with open(args.manifest, newline="") as f:
+                ids = {r["mission_id"] for r in csv.DictReader(f)
+                       if r["status"] == "completed"
+                       and (args.host is None or r.get("host") == args.host)}
+            pcaps = [p for p in pcaps if p.stem in ids]
         if not pcaps:
             print(f"No pcap files in {pcap_dir}")
             sys.exit(1)
@@ -181,7 +213,7 @@ def main():
             mission_id = pcap_path.stem
             output_path = network_dir / f"{mission_id}_network.csv"
 
-            n_frames, n_skipped = convert_pcap(pcap_path, output_path)
+            n_frames, n_skipped = convert_pcap(pcap_path, output_path, offset_ns)
             total_frames += n_frames
             total_skipped += n_skipped
 

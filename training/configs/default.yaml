@@ -8,7 +8,7 @@ seed: 42
 data:
   dataset_dir: "./dataset"
   telemetry_dir: "${data.dataset_dir}/telemetry"
-  network_dir: "${data.dataset_dir}/network"  # future use
+  network_dir: "${data.dataset_dir}/network"  # pcap frames (data/pcap_to_csv.py)
 
   # Resampling: align all message types to common frequency.
   # 4 Hz = native telemetry rate of the SITL recordings (MAVProxy default
@@ -30,6 +30,7 @@ data:
     RAW_IMU: true
     SCALED_PRESSURE: true
     SERVO_OUTPUT_RAW: true
+    network: true  # DroneBridge frames from the pcap capture, raw header fields
 
   # Normalization
   normalization: "zscore"  # zscore | minmax | none
