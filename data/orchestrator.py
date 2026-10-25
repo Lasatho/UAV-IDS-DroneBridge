@@ -25,6 +25,7 @@ from pathlib import Path
 from datetime import datetime
 import math
 import random
+import re
 import threading
 
 from pymavlink import mavutil
@@ -138,6 +139,17 @@ START_OFFSET_MAX_M = 5.0
 # Child processes (tcpdump, telemetry logger, attack scripts) get this long
 # to exit after SIGTERM before they are killed.
 CHILD_STOP_TIMEOUT_S = 15.0
+
+# ArduCopter reports a reached mission item twice: MISSION_ITEM_REACHED and
+# STATUSTEXT "Reached command #N".
+REACHED_RE = re.compile(r"Reached command #(\d+)")
+
+# With no pending mission left the orchestrator stays up and polls the
+# manifest instead of exiting: on exit Docker (restart: unless-stopped)
+# restarted it every ~26 s, each time with a pose reset and SITL reboot
+# (2026-10-24/25). The idle line keeps the watchdog's STALL_S check quiet.
+IDLE_POLL_S = 60
+IDLE_LOG_S = 600
 
 
 def notify(message: str):
@@ -276,17 +288,33 @@ class Orchestrator:
         log.info(f"  Ground phase sim/wall {rtf:.2f} over {wall:.1f} s")
         return rtf
 
-    def arm(self):
+    def arm(self, attempts: int = 3, timeout: float = 3.0):
+        """Force-arm and resend while no COMMAND_ACK arrives.
+
+        The arm command can get lost on the link like SET_MODE (HP
+        mission_30003/30159, TR mission_31527: no ACK, no armed heartbeat).
+        Resending to an already armed vehicle is acknowledged as accepted;
+        a rejection is final.
+        """
         log.info("Arming...")
         while self.conn.recv_match(blocking=False) is not None:
             pass
-        self.conn.mav.command_long_send(
-            self.conn.target_system,
-            self.conn.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0, 1, 21196, 0, 0, 0, 0, 0  # param2=21196 = force arm
-        )
-        return self._wait_for_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM)
+        for attempt in range(1, attempts + 1):
+            self.conn.mav.command_long_send(
+                self.conn.target_system,
+                self.conn.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                attempt - 1,  # confirmation counts resends
+                1, 21196, 0, 0, 0, 0, 0  # param2=21196 = force arm
+            )
+            ok = self._wait_for_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                    timeout=timeout)
+            if ok is not None:
+                if ok and attempt > 1:
+                    log.info(f"  Arm accepted (attempt {attempt})")
+                return ok
+            log.warning(f"  Arm not acknowledged (attempt {attempt}/{attempts})")
+        return False
 
     def disarm(self):
         log.info("Disarming...")
@@ -334,8 +362,15 @@ class Orchestrator:
                                    f"(got {confirmed})")
             log.info(f"  {param_id} confirmed = {confirmed}")
 
-    def upload_mission(self, waypoint_file: Path):
-        """Parse QGC WPL 110 file and upload mission items via pymavlink."""
+    def upload_mission(self, waypoint_file: Path, attempts: int = 3):
+        """Parse a QGC WPL 110 file, upload it and make sure it arrived.
+
+        Without MISSION_ACK the vehicle may still hold the previous mission
+        and fly it (TR mission_31631/31768/31077: path of the mission before).
+        So the upload only counts if it is acknowledged or the mission read
+        back from the vehicle matches the file; otherwise it is repeated, and
+        after the last attempt the run fails before takeoff.
+        """
         items = []
         with open(waypoint_file, "r") as f:
             header = f.readline().strip()
@@ -350,7 +385,25 @@ class Orchestrator:
         n = len(items)
         self.mission_count = n
         log.info(f"  Uploading {n} mission items from {waypoint_file.name}")
+        for attempt in range(1, attempts + 1):
+            ack = self._send_mission(items)
+            if ack is not None and ack.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                log.info(f"  Mission upload accepted ({n} items)"
+                         + (f" (attempt {attempt})" if attempt > 1 else ""))
+                return
+            if ack is None and self._mission_matches(items):
+                log.info(f"  Mission upload without MISSION_ACK, read-back "
+                         f"matches ({n} items)")
+                return
+            log.warning(f"  Mission upload issue: {ack} "
+                        f"(attempt {attempt}/{attempts})")
+        raise RuntimeError("Mission upload failed")
 
+    def _send_mission(self, items: list):
+        """One upload transaction; returns the MISSION_ACK or None."""
+        n = len(items)
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
         self.conn.mav.mission_count_send(
             self.conn.target_system,
             self.conn.target_component,
@@ -388,13 +441,50 @@ class Orchestrator:
             )
             uploaded.add(seq)
 
-        ack = self.conn.recv_match(
+        return self.conn.recv_match(
             type="MISSION_ACK", blocking=True, timeout=10.0
         )
-        if ack and ack.type == 0:
-            log.info(f"  Mission upload accepted ({n} items)")
-        else:
-            log.warning(f"  Mission upload issue: {ack}")
+
+    def _read_mission_msg(self, send, mtype: str, check, tries: int = 3):
+        """Send a mission request and wait for the matching reply."""
+        for _ in range(tries):
+            send()
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                msg = self.conn.recv_match(type=mtype, blocking=True, timeout=0.5)
+                if msg is not None and check(msg):
+                    return msg
+        return None
+
+    def _mission_matches(self, items: list) -> bool:
+        """Read the mission back from the vehicle and compare it with the
+        file: count, and command and position of every item after home
+        (item 0 is replaced by the current home position)."""
+        ts, tc = self.conn.target_system, self.conn.target_component
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+        count = self._read_mission_msg(
+            lambda: self.conn.mav.mission_request_list_send(ts, tc),
+            "MISSION_COUNT", lambda m: True)
+        if count is None or count.count != len(items):
+            log.warning(f"  Read-back: {count.count if count else 'no'} items "
+                        f"on the vehicle, file has {len(items)}")
+            return False
+        ok = True
+        for seq in range(1, len(items)):
+            got = self._read_mission_msg(
+                lambda: self.conn.mav.mission_request_int_send(ts, tc, seq),
+                "MISSION_ITEM_INT", lambda m: m.seq == seq)
+            p = items[seq]
+            if (got is None or got.command != int(p[3])
+                    or abs(got.x - int(float(p[8]) * 1e7)) > 1
+                    or abs(got.y - int(float(p[9]) * 1e7)) > 1
+                    or abs(got.z - float(p[10])) > 0.01):
+                log.warning(f"  Read-back: item {seq} differs from the file")
+                ok = False
+                break
+        self.conn.mav.mission_ack_send(ts, tc, mavutil.mavlink.MAV_MISSION_ACCEPTED)
+        return ok
 
     def estimate_mission_timeout(self, wp_path: Path, meta: dict) -> int:
         """10 min for attack runs (failsafe/hold is the expected attack
@@ -541,14 +631,34 @@ class Orchestrator:
                         f"(attempt {attempt}/{attempts})")
         raise RuntimeError(f"Mode {mode} not accepted")
 
-    def takeoff(self, alt: float):
+    def takeoff(self, alt: float, attempts: int = 3, timeout: float = 2.0):
+        """Send the takeoff command and resend while no COMMAND_ACK arrives.
+
+        The command can get lost on the link like arm and SET_MODE (TR
+        mission_30514: no ACK, the armed vehicle stayed on the ground and
+        ArduCopter disarmed after ~9 s). Attempts stay well inside that
+        auto-disarm delay. A rejection is resent once more after 1 s.
+        """
         log.info(f"[+] Taking off to {alt}m...")
-        self.conn.mav.command_long_send(
-            self.conn.target_system,
-            self.conn.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, alt
-        )
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+        for attempt in range(1, attempts + 1):
+            self.conn.mav.command_long_send(
+                self.conn.target_system,
+                self.conn.target_component,
+                mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                attempt - 1,  # confirmation counts resends
+                0, 0, 0, 0, 0, 0, alt
+            )
+            ok = self._wait_for_ack(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                                    timeout=timeout)
+            if ok:
+                if attempt > 1:
+                    log.info(f"  Takeoff accepted (attempt {attempt})")
+                break
+            log.warning(f"  Takeoff not accepted (attempt {attempt}/{attempts})")
+            if ok is False:
+                time.sleep(1.0)
         self._wait_altitude(alt, tolerance=1.0, timeout=60)
 
     def land(self):
@@ -566,10 +676,12 @@ class Orchestrator:
         time.sleep(duration)
 
     def _wait_for_ack(self, command, timeout=10):
+        """True if accepted, False if rejected, None if no ACK arrived."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             msg = self.conn.recv_match(
-                type="COMMAND_ACK", blocking=True, timeout=2.0
+                type="COMMAND_ACK", blocking=True,
+                timeout=min(2.0, max(deadline - time.time(), 0.1))
             )
             if msg and msg.command == command:
                 if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
@@ -578,7 +690,7 @@ class Orchestrator:
                     log.warning(f"Command {command} rejected: {msg.result}")
                     return False
         log.warning(f"[+] Timeout waiting for ACK for command {command}")
-        return False
+        return None
 
     def _wait_altitude(self, target_alt: float, tolerance=1.0, timeout=60):
         deadline = time.time() + timeout
@@ -782,6 +894,19 @@ class Orchestrator:
                     text = msg.text.strip()
                     log.info(f"  STATUSTEXT: {text}")
                     statustext.append([now, text])
+                    # Same event as MISSION_ITEM_REACHED, which can get lost
+                    # on the link (TR mission_31128/30807/31040: complete
+                    # flight counted as failed)
+                    m = REACHED_RE.match(text)
+                    if m and int(m.group(1)) not in reached:
+                        seq = int(m.group(1))
+                        reached.add(seq)
+                        if first_wp_time is None:
+                            first_wp_time = now
+                        if last_seq > 0 and seq == last_seq:
+                            mission_complete = True
+                        log.info(f"  WP {seq} reached (STATUSTEXT, "
+                                 f"{len(reached)} total)")
                     if "Mission Complete" in text:
                         mission_complete = True
                     if ("Auto disarmed" in text or "Disarming" in text) \
@@ -1277,11 +1402,36 @@ class Orchestrator:
         if not self.keep_running:
             return
 
-        with open(self.manifest_path, "r", newline="") as f:
-            reader = csv.DictReader(f)
-            missions = [row for row in reader]
+        idle_since = None
+        while self.keep_running:
+            with open(self.manifest_path, "r", newline="") as f:
+                missions = list(csv.DictReader(f))
+            pending = [m for m in missions if m["status"] == "pending"]
+            if pending:
+                if idle_since is not None:
+                    # The sim sat idle; start the next pass from a fresh SITL
+                    idle_since = None
+                    self.reboot_sitl()
+                    if not self.keep_running:
+                        break
+                self.run_pass(missions, pending)
+                continue
+            now = time.time()
+            if idle_since is None:
+                idle_since = next_idle_log = now
+                log.info("All pending missions processed — idle, polling the "
+                         "manifest")
+            if now >= next_idle_log:
+                next_idle_log += IDLE_LOG_S
+                log.info(f"  Idle for {(now - idle_since) / 60:.0f} min, "
+                         f"no pending missions")
+            # A low-RTF pause flag of the watchdog waits for "Paused"
+            self.wait_while_paused()
+            time.sleep(IDLE_POLL_S)
 
-        pending = [m for m in missions if m["status"] == "pending"]
+    def run_pass(self, missions: list, pending: list):
+        """Fly the pending missions of one manifest read; missions set back
+        to pending meanwhile are picked up by the next pass."""
         total = len(missions)
         done = total - len(pending)
         log.info(f"Manifest: {total} missions, {done} completed, "
@@ -1319,7 +1469,7 @@ class Orchestrator:
 
         notify(f"[UAV-IDS] Orchestrator finished: {completed_count} completed, "
                f"{failed_count} failed")
-        log.info("All pending missions processed.")
+        log.info("Pass done.")
 
 
 def main():

@@ -31,14 +31,16 @@ import math
 import statistics
 import struct
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 STREAMS = ["GLOBAL_POSITION_INT", "GPS_RAW_INT", "RAW_IMU",
            "SCALED_PRESSURE", "SERVO_OUTPUT_RAW"]
 PRESET_SPEED = {"conservative": 3, "standard": 5, "dynamic": 10, "fast": 12}
-# Sampler log is written in local time (CEST)
-RTF_LOG_TZ = timezone(timedelta(hours=2))
+# Sampler log is written in local time (CEST/CET); a fixed +02:00 shifted
+# all samples by 1 h after the switch to CET on 2026-10-25
+RTF_LOG_TZ = ZoneInfo("Europe/Berlin")
 
 MAX_GAP_S = 1.0
 MIN_GROUND_RTF = 0.75     # sim/wall of the ground phase; normal ~0.8-1.0
@@ -64,7 +66,12 @@ def read_rtf(path):
             v = float(line.rsplit("real_time_factor:", 1)[1].split()[0])
         except ValueError:
             continue
-        samples.append((t.replace(tzinfo=RTF_LOG_TZ).timestamp(), v))
+        ts = t.replace(tzinfo=RTF_LOG_TZ).timestamp()
+        # The hour repeated at the switch to CET: the log is chronological,
+        # so a time before the previous sample is the second (CET) pass
+        if samples and ts < samples[-1][0]:
+            ts = t.replace(tzinfo=RTF_LOG_TZ, fold=1).timestamp()
+        samples.append((ts, v))
     return samples
 
 
