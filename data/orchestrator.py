@@ -140,6 +140,13 @@ START_OFFSET_MAX_M = 5.0
 # to exit after SIGTERM before they are killed.
 CHILD_STOP_TIMEOUT_S = 15.0
 
+# GNSS attacks act on the simulated receiver via SITL parameters. They talk
+# to SITL directly (SERIAL1, TCP 5762), not through MAVProxy and the
+# DroneBridge link: a real GNSS attack sends nothing over the radio, but the
+# PARAM_SETs of gnss_spoofing doubled the uplink frame rate (Befund 32).
+SITL_DIRECT_ATTACKS = {"gnss_spoofing", "gnss_jamming"}
+SITL_DIRECT_CONNECTION = "tcp:127.0.0.1:5762"
+
 # ArduCopter reports a reached mission item twice: MISSION_ITEM_REACHED and
 # STATUSTEXT "Reached command #N".
 REACHED_RE = re.compile(r"Reached command #(\d+)")
@@ -749,6 +756,8 @@ class Orchestrator:
         """Start an attack script as a subprocess."""
         script = Path(f"attacks/{attack_type}.py")
         cmd = ["python3", str(script), "--mission-id", mission_id]
+        if attack_type in SITL_DIRECT_ATTACKS:
+            cmd += ["--connection", SITL_DIRECT_CONNECTION]
         if attack_variant:
             cmd += ["--variant", attack_variant]
         log.info(f"[!] Starting attack: {attack_type}"
