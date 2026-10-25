@@ -91,7 +91,7 @@ def _rssm_space(trial: optuna.Trial) -> dict:
         "model": {
             "rssm": {
                 "hidden_dim": trial.suggest_categorical("hidden_dim", [64, 128, 256]),
-                "deterministic_dim": trial.suggest_categorical("deterministic_dim", [128, 256, 512]),
+                "deterministic_dim": trial.suggest_categorical("deterministic_dim", [128, 256, 512, 1024]),
                 "kl_dyn_beta": trial.suggest_float("kl_dyn_beta", 0.1, 0.8, log=True),
                 "free_nats": trial.suggest_float("free_nats", 0.5, 3.0),
             }
@@ -110,7 +110,7 @@ def _mts_jepa_space(trial: optuna.Trial) -> dict:
         "model": {
             "mts_jepa": {
                 "embed_dim": trial.suggest_categorical("embed_dim", [64, 128, 256]),
-                "depth": trial.suggest_categorical("depth", [4, 6, 8]),
+                "depth": trial.suggest_categorical("depth", [4, 6, 8, 10]),
                 "predictor_depth": trial.suggest_categorical("predictor_depth", [1, 2]),
             }
         },

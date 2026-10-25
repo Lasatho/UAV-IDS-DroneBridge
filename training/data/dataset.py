@@ -15,6 +15,7 @@ mission and resample frequency; subsequent runs memory-map the arrays.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import logging
@@ -146,7 +147,8 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
 
     Expects keys: dataset_dir, telemetry_dir, network_dir, resample_freq_hz,
     window_length, window_stride, split_ratios, split_seed, features,
-    plus optional max_missions (debug subsampling).
+    plus optional max_missions (debug subsampling) and mission_manifest
+    (only the completed missions of that manifest).
 
     Side effects: writes split assignment and normalizer stats to
     `<dataset_dir>/cache/` for reproducibility.
@@ -193,6 +195,22 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
         mission_ids = discover_missions(telemetry_dir, network_dir, enabled)
         if not mission_ids:
             raise RuntimeError(f"No complete missions found in {telemetry_dir}")
+
+        # The dataset directory also holds other sets (v1, attack runs in
+        # progress); restrict to the completed missions of one manifest.
+        if cfg.get("mission_manifest"):
+            with open(cfg["mission_manifest"], newline="") as f:
+                wanted = {r["mission_id"] for r in csv.DictReader(f)
+                          if r["status"] == "completed"}
+            missing = sorted(wanted - set(mission_ids))
+            if missing:
+                raise RuntimeError(
+                    f"{len(missing)} missions of {cfg['mission_manifest']} lack "
+                    f"telemetry or network files, e.g. {missing[:5]}"
+                )
+            mission_ids = sorted(wanted)
+            logger.info("Restricted to %d missions of %s",
+                        len(mission_ids), cfg["mission_manifest"])
 
         max_missions = cfg.get("max_missions")
         if max_missions:

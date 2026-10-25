@@ -29,15 +29,25 @@ MESSAGE_FEATURES: dict[str, list[str]] = {
         "servo5_raw", "servo6_raw", "servo7_raw", "servo8_raw",
     ],
     # DroneBridge radio frames from the pcap capture, one row per frame
-    # with the raw header fields (data/pcap_to_csv.py). Treated exactly like
-    # a telemetry message type; the file lives in the network directory.
-    "network": [
+    # with the raw header fields (data/pcap_to_csv.py), split by direction
+    # into two streams that are each treated exactly like a telemetry
+    # message type. One mixed stream would mostly lose the uplink on the
+    # 4 Hz grid (~1 uplink vs ~5.5 downlink frames/s).
+    "network_up": [
+        "frame_len", "direction", "comm_id", "port", "payload_len", "seq_num",
+    ],
+    "network_down": [
         "frame_len", "direction", "comm_id", "port", "payload_len", "seq_num",
     ],
 }
 
-# Message types read from the network directory instead of the telemetry one
-NETWORK_TYPES = {"network"}
+# Streams read from {mission_id}_network.csv in the network directory,
+# selected by the direction byte: 0x01 = to the drone (uplink); everything
+# else (0x03 = to the GCS, and frames that are no valid DroneBridge frame)
+# goes to the downlink stream so foreign frames stay visible.
+NETWORK_FILE = "network"
+NETWORK_TYPES = {"network_up", "network_down"}
+UPLINK_DIRECTION = 1
 
 # Timestamp columns to drop per message type (not used as features)
 TIMESTAMP_FIELDS: dict[str, list[str]] = {
@@ -46,7 +56,8 @@ TIMESTAMP_FIELDS: dict[str, list[str]] = {
     "RAW_IMU": ["time_usec"],
     "SCALED_PRESSURE": ["time_boot_ms"],
     "SERVO_OUTPUT_RAW": ["time_usec"],
-    "network": [],  # host clock only
+    "network_up": [],  # host clock only
+    "network_down": [],
 }
 
 

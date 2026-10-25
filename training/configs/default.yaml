@@ -9,6 +9,9 @@ data:
   dataset_dir: "./dataset"
   telemetry_dir: "${data.dataset_dir}/telemetry"
   network_dir: "${data.dataset_dir}/network"  # pcap frames (data/pcap_to_csv.py)
+  # Only the completed missions of this manifest (the dataset directory also
+  # holds v1 and the attack runs); null = all complete missions
+  mission_manifest: "${data.dataset_dir}/missions_manifest_v2_merged.csv"
 
   # Resampling: align all message types to common frequency.
   # 4 Hz = native telemetry rate of the SITL recordings (MAVProxy default
@@ -30,7 +33,8 @@ data:
     RAW_IMU: true
     SCALED_PRESSURE: true
     SERVO_OUTPUT_RAW: true
-    network: true  # DroneBridge frames from the pcap capture, raw header fields
+    network_up: true    # DroneBridge frames to the drone (pcap), raw header fields
+    network_down: true  # all other frames (to the GCS, foreign), raw header fields
 
   # Normalization
   normalization: "zscore"  # zscore | minmax | none

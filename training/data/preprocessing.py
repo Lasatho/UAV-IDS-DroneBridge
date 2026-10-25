@@ -32,7 +32,9 @@ import pandas as pd
 
 from .features import (
     MESSAGE_FEATURES,
+    NETWORK_FILE,
     NETWORK_TYPES,
+    UPLINK_DIRECTION,
     TIMESTAMP_COL,
     TIMESTAMP_FIELDS,
     get_feature_columns,
@@ -54,7 +56,7 @@ def discover_missions(
 
     A mission is complete iff every telemetry message type in
     MESSAGE_FEATURES has a file `{mission_id}_{MSG_TYPE}.csv` in
-    telemetry_dir and, if the network stream is enabled, network_dir holds
+    telemetry_dir and, if a network stream is enabled, network_dir holds
     `{mission_id}_network.csv`.
     """
     telemetry_dir = Path(telemetry_dir)
@@ -79,8 +81,7 @@ def discover_missions(
         if network_dir is None:
             raise ValueError("network stream enabled but no network_dir given")
         complete = [m for m in complete
-                    if all((Path(network_dir) / f"{m}_{t}.csv").exists()
-                           for t in enabled_net)]
+                    if (Path(network_dir) / f"{m}_{NETWORK_FILE}.csv").exists()]
 
     n_incomplete = len(candidates) - len(complete)
     if n_incomplete:
@@ -151,7 +152,8 @@ def load_mission(
             native rate is kept.
         enabled_messages: Message-type toggle dict (None = all enabled).
         network_dir: Directory with `{mission_id}_network.csv`
-            (pcap frames, host_timestamp_ns on the telemetry clock).
+            (pcap frames, host_timestamp_ns on the telemetry clock), source
+            of the network_up / network_down streams.
 
     Returns:
         DataFrame indexed 0..T-1 with columns
@@ -172,13 +174,20 @@ def load_mission(
     for msg_type, feats in MESSAGE_FEATURES.items():
         if not enabled_messages.get(msg_type, False):
             continue
-        src = Path(network_dir) if msg_type in NETWORK_TYPES else telemetry_dir
-        path = src / f"{mission_id}_{msg_type}.csv"
+        if msg_type in NETWORK_TYPES:
+            path = Path(network_dir) / f"{mission_id}_{NETWORK_FILE}.csv"
+        else:
+            path = telemetry_dir / f"{mission_id}_{msg_type}.csv"
         if not path.exists():
             raise FileNotFoundError(path)
 
         wanted = {TIMESTAMP_COL, *TIMESTAMP_FIELDS[msg_type], *feats}
         df = pd.read_csv(path, usecols=lambda c: c in wanted)
+        if msg_type in NETWORK_TYPES:
+            up = df["direction"] == UPLINK_DIRECTION
+            df = df[up if msg_type == "network_up" else ~up]
+            if df.empty:
+                raise ValueError(f"{mission_id}: no frames for {msg_type}")
         df = df.sort_values(TIMESTAMP_COL).drop_duplicates(
             subset=TIMESTAMP_COL, keep="last"
         )

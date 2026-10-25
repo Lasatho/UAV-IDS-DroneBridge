@@ -1,0 +1,13 @@
+# === Normal dataset v2 overlay ===
+# Tuning/training on the normal dataset v2 (1968 missions, wind, effective
+# presets) with telemetry and the pcap radio frames (network stream), read
+# from the repository dataset directory instead of the v1 cache-only
+# artifact under training/dataset/.
+#
+# Usage:
+#   cd training
+#   python tune.py --model rssm --experiment configs/v2.yaml --study-name rssm_v2 ...
+
+data:
+  dataset_dir: "../dataset"
+  mission_manifest: "${data.dataset_dir}/missions_manifest_v2_merged.csv"
