@@ -136,6 +136,18 @@ PROGRESS_LOG_S = 300
 SPAWN_LAT, SPAWN_LON = -35.3632621, 149.1652374
 START_OFFSET_MAX_M = 5.0
 
+# Pose reset only once the force-disarmed model lies still: set_pose keeps
+# the model's velocity, a vehicle disarmed in the air and teleported while
+# still falling or tumbling ended up on its back or tilted and the next
+# takeoff failed (Befund 34, reproduced on HP 2026-10-26: at rest after 5-6
+# s from 15 m). Upright means RAW_IMU zacc below UPRIGHT_ZACC_MAX
+# (-1000 mG level, -430 mG tilted ~65 deg, +1000 mG on its back).
+REST_RATE_MAX = 0.05     # rad/s
+REST_VEL_MAX = 0.2       # m/s
+REST_HOLD_S = 2.0
+REST_TIMEOUT_S = 30.0
+UPRIGHT_ZACC_MAX = -900
+
 # Child processes (tcpdump, telemetry logger, attack scripts) get this long
 # to exit after SIGTERM before they are killed.
 CHILD_STOP_TIMEOUT_S = 15.0
@@ -1081,7 +1093,51 @@ class Orchestrator:
             log.warning(f"  Pose reset failed: {r.stdout.strip()} {r.stderr.strip()}")
         return ok
 
-    def reboot_sitl(self):
+    def wait_at_rest(self, timeout=REST_TIMEOUT_S):
+        """Wait until the model lies still: body rates and velocity near
+        zero for REST_HOLD_S. Returns False on timeout."""
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+        t0 = time.time()
+        rates = vel = None
+        still_since = None
+        while time.time() - t0 < timeout:
+            m = self.conn.recv_match(type=["ATTITUDE", "GLOBAL_POSITION_INT"],
+                                     blocking=True, timeout=1.0)
+            if m is None or m.get_srcSystem() == 0:
+                continue
+            if m.get_type() == "ATTITUDE":
+                rates = max(abs(m.rollspeed), abs(m.pitchspeed), abs(m.yawspeed))
+            else:
+                vel = max(abs(m.vx), abs(m.vy), abs(m.vz)) / 100.0
+            if (rates is not None and vel is not None
+                    and rates < REST_RATE_MAX and vel < REST_VEL_MAX):
+                still_since = still_since or time.time()
+                if time.time() - still_since >= REST_HOLD_S:
+                    log.info(f"  Vehicle at rest after {time.time() - t0 + 2:.1f} s")
+                    return True
+            else:
+                still_since = None
+        log.warning(f"  Vehicle not at rest after {timeout:.0f} s "
+                    f"(rates {rates}, vel {vel}) — resetting pose anyway")
+        return False
+
+    def upright_zacc(self, timeout=5.0):
+        """Median RAW_IMU zacc in mG over a few samples (-1000 upright,
+        +1000 on its back), or None if no RAW_IMU arrives."""
+        while self.conn.recv_match(blocking=False) is not None:
+            pass
+        deadline = time.time() + timeout
+        samples = []
+        while time.time() < deadline and len(samples) < 5:
+            m = self.conn.recv_match(type="RAW_IMU", blocking=True, timeout=1.0)
+            if m is not None and m.get_srcSystem() != 0:
+                samples.append(m.zacc)
+        if not samples:
+            return None
+        return sorted(samples)[len(samples) // 2]
+
+    def reboot_sitl(self, upright_retry=True):
         """Reset vehicle pose and SITL state between missions.
 
         Force-disarm first: a vehicle still hovering after a timeout
@@ -1094,7 +1150,11 @@ class Orchestrator:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 0, 21196, 0, 0, 0, 0, 0  # param2=21196 = force disarm
         )
+        # After a timeout in the air the disarmed vehicle falls and tumbles;
+        # set_pose keeps the model's velocity, so a reset before it lies
+        # still can leave it on its back (Befund 34, 2026-10-26).
         time.sleep(2)
+        self.wait_at_rest()
         self.reset_vehicle_pose()
         time.sleep(1)
         log.info("[+] Rebooting SITL...")
@@ -1120,6 +1180,14 @@ class Orchestrator:
                 return
         log.info(f"[+] SITL rebooted, heartbeat OK "
                  f"(sys {self.conn.target_system}:{self.conn.target_component}).")
+        # WORKAROUND (Befund 34): safeguard if the model still is not upright
+        # after the reset; one more reset and reboot, then run_single aborts.
+        zacc = self.upright_zacc()
+        if zacc is not None and zacc > UPRIGHT_ZACC_MAX and upright_retry:
+            log.warning(f"  Vehicle not upright after reboot (zacc {zacc} mG) "
+                        f"— resetting pose and rebooting again")
+            self.reboot_sitl(upright_retry=False)
+            return
         # Start of the ground-phase timing (a healthy GPS wait and upload
         # alone take only ~1 s, too short to measure)
         self._ground_clock0 = self.sim_clock()
@@ -1225,6 +1293,11 @@ class Orchestrator:
                 log.info(f"  Start offset from spawn point {offset:.1f} m")
                 if offset > START_OFFSET_MAX_M:
                     raise SimDegraded(f"start offset {offset:.1f} m > {START_OFFSET_MAX_M} m")
+            # WORKAROUND (Befund 34): force-arm skips the prearm attitude
+            # check, so a model on its back arms and only the takeoff fails.
+            zacc = self.upright_zacc()
+            if zacc is not None and zacc > UPRIGHT_ZACC_MAX:
+                raise SimDegraded(f"vehicle not upright (zacc {zacc} mG)")
 
             self.set_mode("GUIDED")
             if not self.arm():
