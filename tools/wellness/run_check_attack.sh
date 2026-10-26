@@ -38,9 +38,9 @@ if [ "$H" = tr ]; then
   echo "### tuning"
   nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu --format=csv,noheader
   pgrep -af "tune.py" | grep -v pgrep | grep -c "worker-id" | sed 's/^/tune processes (incl. loader workers): /'
-  (cd training && $PY -I $S/tune_status.py optuna_studies rssm_v2 mts_jepa_v2)
-  grep -hiE "Traceback|Error|nan|inf |diverg|failed" training/tune_v2_*.log | grep -v UserWarning | tail -20
-  ls -la --time-style=+%F_%T training/tune_v2_*.log | awk '{print $6, $7}'
+  (cd training && $PY -I $S/tune_status.py optuna_studies rssm_v2b mts_jepa_v2b)
+  grep -hiE "Traceback|Error|nan|inf |diverg|failed" training/tune_v2b_*.log | grep -v UserWarning | tail -20
+  ls -la --time-style=+%F_%T training/tune_v2b_*.log | awk '{print $6, $7}'
 fi
 echo "### DONE"
 } > $O/run_$H.log 2>&1

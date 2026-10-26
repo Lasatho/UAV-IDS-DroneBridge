@@ -12,7 +12,10 @@ Per finished mission (completed/failed):
   radio       frames/s per direction before / during / after the attack,
               foreign frames (no valid direction or comm_id != 200)
   gnss        GPS_RAW_INT fix/satellites and distance GPS_RAW_INT ->
-              GLOBAL_POSITION_INT before vs. during the attack
+              GLOBAL_POSITION_INT before / during the attack and in the last
+              30 s; an issue if the GNSS is disturbed before the attack or
+              still at the end (parameters of an earlier GNSS attack left
+              set, Befund 33)
 Clocks: label and pcap are epoch, telemetry is time.monotonic_ns() of the
 host; converted with the host's clock offset (epoch - monotonic).
 """
@@ -27,6 +30,7 @@ out = Path(sys.argv[4])
 since = time.mktime(datetime.strptime(sys.argv[5], "%Y-%m-%d %H:%M").timetuple()) if len(sys.argv) > 5 else 0
 STREAMS = ["GLOBAL_POSITION_INT", "GPS_RAW_INT", "RAW_IMU", "SCALED_PRESSURE", "SERVO_OUTPUT_RAW"]
 POST_S = 30.0
+GNSS_DEV_M = 5.0  # GPS -> EKF distance of an undisturbed flight stays below
 
 
 def frames(path):
@@ -128,8 +132,9 @@ for r in csv.DictReader(open(manifest)):
         p = col(ds / "telemetry" / f"{mid}_GLOBAL_POSITION_INT.csv", ["host_timestamp_ns", "lat", "lon", "relative_alt"])
         def window(rows, t0, t1):
             return [x for x in rows if t0 <= x[0] / 1e9 + off_ns / 1e9 <= t1]
-        pi = 0; dev = {"pre": 0.0, "atk": 0.0}; fixmin = {}; satmin = {}
-        for name, (t0, t1) in {"pre": (a0 - 30, a0), "atk": (a0, a1)}.items():
+        pi = 0; dev = {"pre": 0.0, "atk": 0.0, "end": 0.0}; fixmin = {}; satmin = {}
+        for name, (t0, t1) in {"pre": (a0 - 30, a0), "atk": (a0, a1),
+                               "end": (L["end_time"] - 30, L["end_time"])}.items():
             gw = window(g, t0, t1)
             fixmin[name] = min((x[1] for x in gw), default=None)
             satmin[name] = min((x[2] for x in gw), default=None)
@@ -140,6 +145,12 @@ for r in csv.DictReader(open(manifest)):
                     dev[name] = max(dev[name], dist(x[3] / 1e7, x[4] / 1e7, p[pi][1] / 1e7, p[pi][2] / 1e7))
             pi = 0
         o["gps"] = {"fix_min": fixmin, "sat_min": satmin, "dev_max_m": {k: round(v, 1) for k, v in dev.items()}}
+        # the end window needs time after the attack: after a spoofing reset
+        # the GPS needs up to ~20 s to rejoin the EKF position
+        for name in ("pre", "end") if o["post_s"] >= 60 else ("pre",):
+            if dev[name] >= GNSS_DEV_M or (fixmin[name] is not None and fixmin[name] < 3):
+                iss.append(f"GNSS disturbed {'before the attack' if name == 'pre' else 'at mission end'}: "
+                           f"GPS->EKF {dev[name]:.1f} m, fix min {fixmin[name]}")
     except Exception as e:
         iss.append(f"telemetry read error {e}")
     # radio
