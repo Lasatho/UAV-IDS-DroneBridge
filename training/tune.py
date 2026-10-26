@@ -104,13 +104,14 @@ def _mts_jepa_space(trial: optuna.Trial) -> dict:
         "training": {
             # Stage 1: best lr 1.3e-4..9.5e-4 (lower edge opened), depth 6
             # (upper edge, opened to 8), predictor_depth 1 (3 never competitive).
+            # Study mts_jepa_v2: best 5 all at depth 10 (upper edge, opened to 14).
             "lr": trial.suggest_float("lr", 5e-5, 2e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
         },
         "model": {
             "mts_jepa": {
                 "embed_dim": trial.suggest_categorical("embed_dim", [64, 128, 256]),
-                "depth": trial.suggest_categorical("depth", [4, 6, 8, 10]),
+                "depth": trial.suggest_categorical("depth", [4, 6, 8, 10, 12, 14]),
                 "predictor_depth": trial.suggest_categorical("predictor_depth", [1, 2]),
             }
         },
