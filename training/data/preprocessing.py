@@ -19,6 +19,12 @@ Design decisions:
   whole mission has a uniform cadence of ~resample_freq_hz.
 - Output column order is defined by features.get_feature_columns() and
   is identical for every mission (stable model input layout).
+- Rows before the first 3D GPS fix are dropped. Some recordings start
+  before the fix; GPS_RAW_INT then carries placeholder values (lat/lon 0,
+  eph/epv 65535) that sit ~750 sigma off after normalization and caused
+  the RSSM KL spikes of tuning study rssm_v2 (Befund in training_runs_4hz
+  9.1). Only leading rows: a fix lost later in flight (GNSS jamming) is
+  data and stays.
 """
 
 from __future__ import annotations
@@ -41,6 +47,13 @@ from .features import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Bumped whenever load_mission changes its output; part of the cache key
+# (dataset._cache_dir), so stale caches are not reused.
+# 2: rows before the first 3D GPS fix dropped.
+PREPROCESSING_VERSION = 2
+GPS_FIX_COL = "GPS_RAW_INT__fix_type"
+GPS_FIX_3D = 3
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +249,12 @@ def load_mission(
 
     if aligned[feature_cols].isna().any().any():
         raise ValueError(f"{mission_id}: NaNs remain after fill")
+
+    if GPS_FIX_COL in aligned.columns:
+        fixed = np.flatnonzero(aligned[GPS_FIX_COL].to_numpy() >= GPS_FIX_3D)
+        if fixed.size == 0:
+            raise ValueError(f"{mission_id}: no 3D GPS fix")
+        aligned = aligned.iloc[fixed[0]:].reset_index(drop=True)
 
     aligned = aligned.rename(columns={TIMESTAMP_COL: "t_ns"})
     aligned[feature_cols] = aligned[feature_cols].astype(np.float32)

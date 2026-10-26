@@ -26,7 +26,9 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .features import get_feature_columns
-from .preprocessing import Normalizer, discover_missions, load_mission
+from .preprocessing import (
+    PREPROCESSING_VERSION, Normalizer, discover_missions, load_mission,
+)
 from .windowing import build_window_index
 
 logger = logging.getLogger(__name__)
@@ -63,8 +65,9 @@ def split_missions(
 # ---------------------------------------------------------------------------
 
 def _cache_dir(dataset_dir: Path, resample_freq_hz: float, feature_cols: list[str]) -> Path:
-    """Cache directory keyed by frequency and feature set."""
-    feat_hash = hashlib.sha1("|".join(feature_cols).encode()).hexdigest()[:8]
+    """Cache directory keyed by frequency, feature set and preprocessing version."""
+    key = "|".join(feature_cols) + f"|pre{PREPROCESSING_VERSION}"
+    feat_hash = hashlib.sha1(key.encode()).hexdigest()[:8]
     return Path(dataset_dir) / "cache" / f"{resample_freq_hz:g}hz_{feat_hash}"
 
 
