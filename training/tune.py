@@ -47,6 +47,11 @@ Seed replicates of the best configurations of a finished study (separate
 study <source>_seeds, no pruning):
     python tune.py --model rssm --replicate-from rssm_score1b --top 5 --seeds 1 2
 
+After widening the search space, continue in a new study that starts from
+the finished trials of the old one (one process per worker as above):
+    python tune.py --model rssm --study-name rssm_v2c --warm-start-from rssm_v2b \
+        --gpu-mem-fraction 0.19 --worker-id 0 ...
+
 Results: optuna_studies/<study>.db (SQLite, default study <model>_score1b).
 Inspect with:
     optuna-dashboard sqlite:///optuna_studies/rssm_score.db
@@ -85,15 +90,19 @@ def _rssm_space(trial: optuna.Trial) -> dict:
             # Upper bounds from stage 1: lr > ~2e-3 or kl_dyn_beta > ~0.6
             # led to KL explosions; the best configurations sat at the edge
             # of the former architecture ranges (hidden 128, deterministic 256).
-            "lr": trial.suggest_float("lr", 1e-4, 2e-3, log=True),
+            # Study rssm_v2b (cleaned data): best at deterministic 1024 and
+            # free_nats ~2.9 (upper edges); the stage-1 limits were never
+            # checked against the GPS placeholder artefact. All upper bounds
+            # opened one step to find where the range really ends.
+            "lr": trial.suggest_float("lr", 1e-4, 5e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
         },
         "model": {
             "rssm": {
-                "hidden_dim": trial.suggest_categorical("hidden_dim", [64, 128, 256]),
-                "deterministic_dim": trial.suggest_categorical("deterministic_dim", [128, 256, 512, 1024]),
-                "kl_dyn_beta": trial.suggest_float("kl_dyn_beta", 0.1, 0.8, log=True),
-                "free_nats": trial.suggest_float("free_nats", 0.5, 3.0),
+                "hidden_dim": trial.suggest_categorical("hidden_dim", [32, 64, 128, 256, 512]),
+                "deterministic_dim": trial.suggest_categorical("deterministic_dim", [128, 256, 512, 1024, 2048]),
+                "kl_dyn_beta": trial.suggest_float("kl_dyn_beta", 0.1, 1.5, log=True),
+                "free_nats": trial.suggest_float("free_nats", 0.5, 6.0),
             }
         },
     }
@@ -105,13 +114,15 @@ def _mts_jepa_space(trial: optuna.Trial) -> dict:
             # Stage 1: best lr 1.3e-4..9.5e-4 (lower edge opened), depth 6
             # (upper edge, opened to 8), predictor_depth 1 (3 never competitive).
             # Study mts_jepa_v2: best 5 all at depth 10 (upper edge, opened to 14).
-            "lr": trial.suggest_float("lr", 5e-5, 2e-3, log=True),
+            # Study mts_jepa_v2b: best 5 all at depth 14 (upper edge, opened to
+            # 20, sampled as an ordered integer); lr upper bound opened to 5e-3.
+            "lr": trial.suggest_float("lr", 5e-5, 5e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
         },
         "model": {
             "mts_jepa": {
                 "embed_dim": trial.suggest_categorical("embed_dim", [64, 128, 256]),
-                "depth": trial.suggest_categorical("depth", [4, 6, 8, 10, 12, 14]),
+                "depth": trial.suggest_int("depth", 4, 20, step=2),
                 "predictor_depth": trial.suggest_categorical("predictor_depth", [1, 2]),
             }
         },
@@ -186,6 +197,16 @@ def make_objective(
     quiet_logger = MetricLogger({"logging": {"backend": "none"}})
 
     def objective(trial: optuna.Trial) -> float:
+        # A configuration too large for the worker's GPU share is a failed
+        # trial (NaN -> TrialState.FAIL), not a crash of the worker.
+        try:
+            return _objective(trial)
+        except torch.cuda.OutOfMemoryError:
+            trial.set_user_attr("oom", True)
+            torch.cuda.empty_cache()
+            return float("nan")
+
+    def _objective(trial: optuna.Trial) -> float:
         if replicate and "seed" not in trial.user_attrs:
             # Queue drained by another worker: the sampler proposed a new
             # configuration, which does not belong in a replicate study.
@@ -259,6 +280,64 @@ def _create_study(study_name: str, storage, cfg: dict, worker_id: int,
     )
 
 
+class _DistributionRecorder:
+    """Stands in for a trial: answers each suggest_* call with the value of
+    `params` and records the distribution the search space now uses."""
+
+    def __init__(self, params: dict):
+        self.params, self.distributions = params, {}
+
+    def _record(self, name, dist):
+        self.distributions[name] = dist
+        return self.params[name]
+
+    def suggest_float(self, name, low, high, *, step=None, log=False):
+        return self._record(name, optuna.distributions.FloatDistribution(low, high, step=step, log=log))
+
+    def suggest_int(self, name, low, high, *, step=1, log=False):
+        return self._record(name, optuna.distributions.IntDistribution(low, high, step=step, log=log))
+
+    def suggest_categorical(self, name, choices):
+        return self._record(name, optuna.distributions.CategoricalDistribution(choices))
+
+
+def _warm_start(study: optuna.Study, source: optuna.Study, model_name: str) -> None:
+    """Copy the finished trials of `source` into `study` under the current
+    search space, so a widened space does not discard what TPE has learned.
+
+    Optuna refuses changed categorical choices within one study, hence a new
+    study. Idempotent: trials already copied (user attr warm_start_from) are
+    skipped, so every worker can call it at start. Trials whose values lie
+    outside the current space are not copied.
+    """
+    done = {t.user_attrs.get("warm_start_from") for t in study.trials}
+    finished = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED,
+                optuna.trial.TrialState.FAIL)
+    n = 0
+    for t in source.trials:
+        tag = f"{source.study_name}#{t.number}"
+        if t.state not in finished or tag in done or not t.params:
+            continue
+        rec = _DistributionRecorder(t.params)
+        SEARCH_SPACES[model_name](rec)
+        if not all(d._contains(d.to_internal_repr(t.params[k]))
+                   for k, d in rec.distributions.items()):
+            logger.warning("Warm start: %s outside the current space, skipped", tag)
+            continue
+        # FrozenTrial instead of create_trial: keeps the start/end times, so
+        # durations per trial stay meaningful in the new study
+        study.add_trial(optuna.trial.FrozenTrial(
+            number=-1, trial_id=-1, state=t.state,
+            value=t.value if t.state == optuna.trial.TrialState.COMPLETE else None,
+            datetime_start=t.datetime_start, datetime_complete=t.datetime_complete,
+            params=t.params, distributions=rec.distributions,
+            user_attrs={**t.user_attrs, "warm_start_from": tag},
+            system_attrs={}, intermediate_values=t.intermediate_values,
+        ))
+        n += 1
+    logger.info("Warm start: %d trials copied from %s", n, source.study_name)
+
+
 def _enqueue_replicates(study: optuna.Study, source: optuna.Study,
                         top: int, seeds: list[int]) -> None:
     """Queue the `top` best completed configurations of `source` once per seed.
@@ -300,6 +379,13 @@ def main() -> None:
                              "with each of --seeds (study STUDY_seeds, no pruning)")
     parser.add_argument("--top", type=int, default=5)
     parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2])
+    parser.add_argument("--warm-start-from", default=None, metavar="STUDY",
+                        help="Copy the finished trials of STUDY into the study "
+                             "under the current search space (after widening it)")
+    parser.add_argument("--gpu-mem-fraction", type=float, default=None,
+                        help="Cap this process's share of GPU memory, so an "
+                             "oversized trial fails alone instead of starving "
+                             "parallel workers")
     parser.add_argument("--worker-id", type=int, default=0,
                         help="Distinct per parallel process on the same study "
                              "(offsets the TPE sampler seed)")
@@ -318,6 +404,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
+    if args.gpu_mem_fraction and device.type == "cuda":
+        torch.cuda.set_per_process_memory_fraction(args.gpu_mem_fraction)
 
     # window_length/stride, resample_freq_hz and features are fixed across
     # all trials -> dataloaders (and the underlying .npy cache) are built
@@ -348,6 +436,11 @@ def main() -> None:
     except optuna.exceptions.DuplicatedStudyError:
         study = _create_study(study_name, storage, cfg, args.worker_id,
                               pruning=not replicate)
+
+    if args.warm_start_from:
+        _warm_start(study, optuna.load_study(study_name=args.warm_start_from,
+                                             storage=_storage(args.warm_start_from)),
+                    args.model)
 
     n_trials = args.n_trials
     if replicate:
