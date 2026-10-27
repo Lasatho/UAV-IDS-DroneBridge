@@ -114,17 +114,20 @@ for r in csv.DictReader(open(manifest)):
             if s == "RAW_IMU" and t:
                 span = (t[0] + off_ns / 1e9, t[-1] + off_ns / 1e9)
         o["max_gap_s"] = max(v for v in gaps.values() if v is not None)
-        # rf_jamming cuts the radio link the telemetry is recorded over: a
-        # gap from the attack start until the link is back is the attack
-        # effect (link loss), reported as link_loss_s, not as an issue
+        # rf_jamming cuts the radio link the telemetry is recorded over, and
+        # the injected frames of frame_injection crowd it out: a gap that
+        # overlaps the attack (for rf_jamming until the link is back) is the
+        # attack effect, reported as link_loss_s, not as an issue
         t = [x[0] / 1e9 + off_ns / 1e9 for x in col(ds / "telemetry" / f"{mid}_GLOBAL_POSITION_INT.csv", ["host_timestamp_ns"])]
         big = [(a, b) for a, b in zip(t, t[1:]) if b - a > 1.0]
-        if r["attack_type"] == "rf_jamming":
-            loss = [(a, b) for a, b in big if a <= a1 + 1 and b >= a0 - 1]
-            o["link_loss_s"] = round(sum(b - a for a, b in loss), 1)
-            big = [g for g in big if g not in loss]
-        if big:
-            iss.append(f"telemetry gap {max(b - a for a, b in big):.1f} s outside the attack")
+        in_atk = [(a, b) for a, b in big if a <= a1 + 1 and b >= a0 - 1]
+        if r["attack_type"] in ("rf_jamming", "frame_injection"):
+            o["link_loss_s"] = round(sum(b - a for a, b in in_atk), 1)
+            big = [g for g in big if g not in in_atk]
+        for where, gs in (("in", [g for g in big if g in in_atk]),
+                          ("outside", [g for g in big if g not in in_atk])):
+            if gs:
+                iss.append(f"telemetry gap {max(b - a for a, b in gs):.1f} s {where} the attack")
         if span and not (span[0] - 5 <= a0 and a1 <= span[1] + 1):
             iss.append("attack outside telemetry span (clock offset?)")
         # gnss
