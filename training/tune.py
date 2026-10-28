@@ -116,13 +116,14 @@ def _mts_jepa_space(trial: optuna.Trial) -> dict:
             # Study mts_jepa_v2: best 5 all at depth 10 (upper edge, opened to 14).
             # Study mts_jepa_v2b: best 5 all at depth 14 (upper edge, opened to
             # 20, sampled as an ordered integer); lr upper bound opened to 5e-3.
+            # Study mts_jepa_v2c: best at depth 20 (upper edge, opened to 28).
             "lr": trial.suggest_float("lr", 5e-5, 5e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
         },
         "model": {
             "mts_jepa": {
                 "embed_dim": trial.suggest_categorical("embed_dim", [64, 128, 256]),
-                "depth": trial.suggest_int("depth", 4, 20, step=2),
+                "depth": trial.suggest_int("depth", 4, 28, step=2),
                 "predictor_depth": trial.suggest_categorical("predictor_depth", [1, 2]),
             }
         },
