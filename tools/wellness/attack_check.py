@@ -16,6 +16,10 @@ Per finished mission (completed/failed):
               30 s; an issue if the GNSS is disturbed before the attack or
               still at the end (parameters of an earlier GNSS attack left
               set, Befund 33)
+  landing     on its back on the ground while armed (RAW_IMU zacc > 0 for
+              > 3 s below 0.5 m after having flown, before the disarm),
+              force-disarm by the orchestrator's flip detection, and LAND or
+              RTL after the attack that ends in the timeout (Befund 35)
 Clocks: label and pcap are epoch, telemetry is time.monotonic_ns() of the
 host; converted with the host's clock offset (epoch - monotonic).
 """
@@ -31,6 +35,7 @@ since = time.mktime(datetime.strptime(sys.argv[5], "%Y-%m-%d %H:%M").timetuple()
 STREAMS = ["GLOBAL_POSITION_INT", "GPS_RAW_INT", "RAW_IMU", "SCALED_PRESSURE", "SERVO_OUTPUT_RAW"]
 POST_S = 30.0
 GNSS_DEV_M = 5.0  # GPS -> EKF distance of an undisturbed flight stays below
+FLIPPED_HOLD_S = 3.0  # as the orchestrator's flip detection
 
 
 def frames(path):
@@ -154,8 +159,32 @@ for r in csv.DictReader(open(manifest)):
             if dev[name] >= GNSS_DEV_M or (fixmin[name] is not None and fixmin[name] < 3):
                 iss.append(f"GNSS disturbed {'before the attack' if name == 'pre' else 'at mission end'}: "
                            f"GPS->EKF {dev[name]:.1f} m, fix min {fixmin[name]}")
+        # landing: replay of the orchestrator's flip detection up to the
+        # disarm (or the end); armed on its back beyond its hold time means
+        # the detection did not act (before its deployment: Befund 35)
+        imu = col(ds / "telemetry" / f"{mid}_RAW_IMU.csv", ["host_timestamp_ns", "zacc"])
+        stop = L.get("disarm_time") or L["end_time"]
+        ev = sorted([(x[0], 0, x[3]) for x in p] + [(x[0], 1, x[1]) for x in imu])
+        air = False; alt = None; back0 = None; on_back = 0.0
+        for t, k, v in ev:
+            t = t / 1e9 + off_ns / 1e9
+            if t > stop:
+                break
+            if k == 0:
+                alt = v / 1000.0; air = air or alt > 5.0
+            elif air and alt is not None and alt < 0.5 and v > 0:
+                back0 = back0 or t; on_back = max(on_back, t - back0)
+            else:
+                back0 = None
+        o["on_back_armed_s"] = round(on_back, 1)
+        if on_back > FLIPPED_HOLD_S + 1:
+            iss.append(f"on its back on the ground while armed {on_back:.0f} s")
     except Exception as e:
         iss.append(f"telemetry read error {e}")
+    if L.get("flipped_disarmed"):
+        iss.append("flipped on touchdown, force-disarmed by the orchestrator")
+    if L.get("timed_out") and set(o["modes_after"]) & {"LAND", "RTL"}:
+        iss.append(f"timed out after {'/'.join(m for m in o['modes_after'] if m in ('LAND', 'RTL'))}")
     # radio
     try:
         cnt = {k: {"up": 0, "down": 0, "foreign": 0} for k in ("pre", "atk", "post")}
