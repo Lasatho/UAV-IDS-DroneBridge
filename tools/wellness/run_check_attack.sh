@@ -38,9 +38,15 @@ if [ "$H" = tr ]; then
   echo "### tuning"
   nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu --format=csv,noheader
   pgrep -af "tune.py" | grep -v pgrep | grep -c "worker-id" | sed 's/^/tune processes (incl. loader workers): /'
-  (cd training && $PY -I $S/tune_status.py optuna_studies rssm_v2c mts_jepa_v2c)
-  grep -hiE "Traceback|Error|nan|inf |diverg|failed" training/tune_v2c_*.log | grep -v UserWarning | tail -20
-  ls -la --time-style=+%F_%T training/tune_v2c_*.log | awk '{print $6, $7}'
+  # studies of the running workers plus those written in the last 24 h (a
+  # finished study stays in the report for a day); no fixed study names
+  ST=$(cd training && { pgrep -af "tune.py" | grep -o -- "--study-name [^ ]*" | cut -d' ' -f2
+       find optuna_studies -maxdepth 1 -name '*.db' -mmin -1440 -printf '%f\n' | sed 's/\.db$//'; } | sort -u | tr '\n' ' ')
+  echo "studies: $ST"
+  [ -n "$ST" ] && (cd training && $PY -I $S/tune_status.py optuna_studies $ST)
+  LOGS=$(find training -maxdepth 1 -name 'tune_*.log' -mmin -1440 | sort)
+  [ -n "$LOGS" ] && grep -hiE "Traceback|Error|nan|inf |diverg|failed" $LOGS | grep -v UserWarning | tail -20
+  [ -n "$LOGS" ] && ls -la --time-style=+%F_%T $LOGS | awk '{print $6, $7}'
 fi
 echo "### DONE"
 } > $O/run_$H.log 2>&1

@@ -43,6 +43,13 @@ for name in sys.argv[2:]:
     for t in tr:
         states[t.state.name] = states.get(t.state.name, 0) + 1
     print(f"== {name}: {len(tr)} trials {states}")
+    # warm-started studies also hold the copied trials of the earlier study
+    own = [t for t in tr if "warm_start_from" not in t.user_attrs]
+    if len(own) < len(tr):
+        os_ = {}
+        for t in own:
+            os_[t.state.name] = os_.get(t.state.name, 0) + 1
+        print(f"   own trials (no warm start): {len(own)} {os_}")
     done = [t for t in tr if t.state.name == "COMPLETE"]
     ended = [t for t in tr if t.state.name in ("COMPLETE", "PRUNED", "FAIL")]
     durs = [(t.datetime_complete - t.datetime_start).total_seconds() / 3600 for t in tr
