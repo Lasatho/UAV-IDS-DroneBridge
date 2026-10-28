@@ -109,6 +109,15 @@ LANDED_VZ_MS = 0.2
 LANDED_HOLD_S = 10.0
 AIRBORNE_ALT_M = 5.0
 
+# A model that tips over on touchdown in LAND (yaw spin from 100 m, Befund
+# 35) lies on its back with the motors running, slides faster than
+# LANDED_VH_MS and ArduCopter's crash check does not fire: it stayed armed
+# until the mission timeout (8 missions, ~450 s of a vehicle on its back).
+# The orchestrator force-disarms after FLIPPED_HOLD_S of relative altitude
+# < LANDED_ALT_M with RAW_IMU zacc above FLIPPED_ZACC_MIN (tilt > 90 deg).
+FLIPPED_ZACC_MIN = 0
+FLIPPED_HOLD_S = 3.0
+
 # Normal-run timeout per mission: flight time of the split_manifest time
 # model (no wind) times the largest actual/model ratio measured for its wind
 # profile and preset on the v2 run (HP and TR, 2026-10-13), times
@@ -823,6 +832,9 @@ class Orchestrator:
         was_airborne = False
         on_ground_since = None
         landed_by_orchestrator = False
+        flipped_since = None
+        flipped_disarmed = False
+        rel_alt = None
 
         # Attack state
         attack_proc = None
@@ -854,12 +866,13 @@ class Orchestrator:
                 "mode_changes": mode_changes,
                 "statustext": statustext,
                 "landed_by_orchestrator": landed_by_orchestrator,
+                "flipped_disarmed": flipped_disarmed,
             }
 
         while time.time() < deadline and self.keep_running:
             msg = self.conn.recv_match(
                 type=["STATUSTEXT", "MISSION_ITEM_REACHED", "HEARTBEAT",
-                      "GLOBAL_POSITION_INT"],
+                      "GLOBAL_POSITION_INT", "RAW_IMU"],
                 blocking=True, timeout=2.0
             )
 
@@ -944,6 +957,7 @@ class Orchestrator:
                 elif mtype == "GLOBAL_POSITION_INT":
                     if msg.get_srcSystem() != 0:
                         last_pos = msg
+                        rel_alt = msg.relative_alt / 1000.0
                     if msg.get_srcSystem() == 0:
                         pass
                     elif msg.relative_alt / 1000.0 > AIRBORNE_ALT_M:
@@ -973,6 +987,28 @@ class Orchestrator:
                                 mission_complete = True
                     else:
                         on_ground_since = None
+
+                elif mtype == "RAW_IMU":
+                    if (was_airborne and disarm_time is None
+                            and rel_alt is not None and rel_alt < LANDED_ALT_M
+                            and msg.zacc > FLIPPED_ZACC_MIN):
+                        if flipped_since is None:
+                            flipped_since = now
+                        elif now - flipped_since >= FLIPPED_HOLD_S:
+                            log.warning(f"  Vehicle on its back on the ground "
+                                        f"(zacc {msg.zacc} mG) — force disarm "
+                                        f"(orchestrator flip detection)")
+                            self.conn.mav.command_long_send(
+                                self.conn.target_system,
+                                self.conn.target_component,
+                                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                0, 0, 21196, 0, 0, 0, 0, 0
+                            )
+                            flipped_disarmed = True
+                            disarm_time = now
+                            disarm_reason = "flipped on the ground, force-disarmed by orchestrator"
+                    else:
+                        flipped_since = None
 
                 elif mtype == "HEARTBEAT":
                     if (msg.type == mavutil.mavlink.MAV_TYPE_QUADROTOR
@@ -1042,6 +1078,7 @@ class Orchestrator:
             "mode_changes": flight.get("mode_changes", []),
             "statustext": flight.get("statustext", []),
             "landed_by_orchestrator": flight.get("landed_by_orchestrator", False),
+            "flipped_disarmed": flight.get("flipped_disarmed", False),
             "wind": wind,
             "notes": notes
         }
