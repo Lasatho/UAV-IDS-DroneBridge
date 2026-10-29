@@ -8,7 +8,8 @@ Per finished mission (completed/failed):
   attack      fired, duration vs. schedule from attack_seed, start offset
               after AUTO, post-attack recording >= 30 s (unless timed out),
               c2 variant = meta, modes after the attack start, disarm reason
-  telemetry   largest gap per stream, span vs. label duration
+  telemetry   largest gap per stream, span vs. label duration; gaps on the
+              ground before liftoff separately (pre_takeoff_gap_s)
   radio       frames/s per direction before / during / after the attack,
               foreign frames (no valid direction or comm_id != 200)
   gnss        GPS_RAW_INT fix/satellites and distance GPS_RAW_INT ->
@@ -36,6 +37,7 @@ STREAMS = ["GLOBAL_POSITION_INT", "GPS_RAW_INT", "RAW_IMU", "SCALED_PRESSURE", "
 POST_S = 30.0
 GNSS_DEV_M = 5.0  # GPS -> EKF distance of an undisturbed flight stays below
 FLIPPED_HOLD_S = 3.0  # as the orchestrator's flip detection
+PRE_TAKEOFF_GAP_S = 2.0  # telemetry gap on the ground before liftoff
 
 
 def frames(path):
@@ -123,12 +125,22 @@ for r in csv.DictReader(open(manifest)):
         # the injected frames of frame_injection crowd it out: a gap that
         # overlaps the attack (for rf_jamming until the link is back) is the
         # attack effect, reported as link_loss_s, not as an issue
-        t = [x[0] / 1e9 + off_ns / 1e9 for x in col(ds / "telemetry" / f"{mid}_GLOBAL_POSITION_INT.csv", ["host_timestamp_ns"])]
+        gp = col(ds / "telemetry" / f"{mid}_GLOBAL_POSITION_INT.csv", ["host_timestamp_ns", "relative_alt"])
+        t = [x[0] / 1e9 + off_ns / 1e9 for x in gp]
         big = [(a, b) for a, b in zip(t, t[1:]) if b - a > 1.0]
         in_atk = [(a, b) for a, b in big if a <= a1 + 1 and b >= a0 - 1]
         if r["attack_type"] in ("rf_jamming", "frame_injection"):
             o["link_loss_s"] = round(sum(b - a for a, b in in_atk), 1)
             big = [g for g in big if g not in in_atk]
+        # a gap on the ground before liftoff (> 1 m) does not touch the flight
+        # (HP, from mission ~40870 on, up to 1.14 s just after the logger
+        # start): reported as pre_takeoff_gap_s, an issue only above 2 s
+        lift = next((t[i] for i, x in enumerate(gp) if x[1] > 1000), None)
+        pre = [g for g in big if lift is not None and g[1] <= lift and g not in in_atk]
+        o["pre_takeoff_gap_s"] = round(max((b - a for a, b in pre), default=0.0), 2)
+        if o["pre_takeoff_gap_s"] > PRE_TAKEOFF_GAP_S:
+            iss.append(f"telemetry gap {o['pre_takeoff_gap_s']:.1f} s before takeoff")
+        big = [g for g in big if g not in pre]
         for where, gs in (("in", [g for g in big if g in in_atk]),
                           ("outside", [g for g in big if g not in in_atk])):
             if gs:
@@ -205,6 +217,9 @@ print(f"{len(res)} missions checked, {sum(bool(o['issues']) for o in res)} with 
 for o in res:
     if o["issues"]:
         print(o["id"], o["attack"], o["variant"] or "", "|", "; ".join(o["issues"]))
+pre_gap = [o for o in res if o.get("pre_takeoff_gap_s", 0) > 1.0]
+print(f"pre-takeoff telemetry gap > 1 s: {len(pre_gap)}, max {max((o['pre_takeoff_gap_s'] for o in pre_gap), default=0.0):.2f} s",
+      " ".join(o["id"][8:] for o in pre_gap))
 # per attack type summary
 import statistics as st
 by = {}
