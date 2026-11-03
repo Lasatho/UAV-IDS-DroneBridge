@@ -8,15 +8,23 @@ computation/application.
 Design decisions:
 - Alignment key is `host_timestamp_ns` (clock on the capture host),
   shared across all message types of a mission.
-- The time axis is sample-driven, not a fixed host-clock grid: one
-  reference message type defines the timesteps, all other types are
-  matched to the nearest sample. A fixed grid would pick samples twice
-  or skip them whenever host arrival jitters or SITL runs slower than
-  real time, producing artificial staircase steps.
+- Two time axes (time_axis):
+  - "raster" (default of the configs since 2026-11-03): fixed grid on the
+    receiving host's clock, one row every 1/resample_freq_hz from the
+    first common timestamp; each channel holds its last received value.
+    This is what an IDS on the vehicle does: it infers on its own clock,
+    whether or not new data arrived. A link loss therefore shows up as
+    frozen values, and network frames received in that time still reach
+    the model. Cost: arrival jitter or SITL slower than real time repeats
+    or skips single samples.
+  - "sample" (behaviour up to 2026-11-03, fallback when a config has no
+    time_axis, e.g. older checkpoints): one reference message type
+    defines the timesteps, all other types are matched to the nearest
+    sample. A gap in the telemetry is a single step and invisible.
 - The SITL recordings arrive at 4 Hz (MAVProxy's default stream rate
   overrides the logger's 50 Hz request a few seconds into each mission).
-  The initial 50 Hz segment is thinned out on the autopilot clock so the
-  whole mission has a uniform cadence of ~resample_freq_hz.
+  In "sample" mode the initial 50 Hz segment is thinned out on the
+  autopilot clock; the raster takes one value per tick anyway.
 - Output column order is defined by features.get_feature_columns() and
   is identical for every mission (stable model input layout).
 - Rows before the first 3D GPS fix are dropped. Some recordings start
@@ -52,6 +60,7 @@ logger = logging.getLogger(__name__)
 # (dataset._cache_dir), so stale caches are not reused.
 # 2: rows before the first 3D GPS fix dropped.
 PREPROCESSING_VERSION = 2
+TIME_AXES = ("raster", "sample")
 GPS_FIX_COL = "GPS_RAW_INT__fix_type"
 GPS_FIX_3D = 3
 
@@ -148,14 +157,17 @@ def load_mission(
     resample_freq_hz: float = 4.0,
     enabled_messages: dict[str, bool] | None = None,
     network_dir: str | Path | None = None,
+    time_axis: str = "sample",
 ) -> pd.DataFrame:
     """Load one mission and align all message types onto a common time axis.
 
-    The first enabled message type is the reference: its samples, thinned
-    to ~resample_freq_hz on the autopilot clock, are the timesteps. Every
-    other message type contributes its nearest sample within half a
-    period, so no sample is repeated as long as all types arrive at the
-    target rate.
+    time_axis "raster": rows on a fixed grid of the host clock, every
+    message type contributes its last sample at or before the tick.
+    time_axis "sample": the first enabled message type is the reference:
+    its samples, thinned to ~resample_freq_hz on the autopilot clock, are
+    the timesteps. Every other message type contributes its nearest sample
+    within half a period, so no sample is repeated as long as all types
+    arrive at the target rate.
 
     Args:
         telemetry_dir: Directory containing the per-mission CSVs.
@@ -167,6 +179,7 @@ def load_mission(
         network_dir: Directory with `{mission_id}_network.csv`
             (pcap frames, host_timestamp_ns on the telemetry clock), source
             of the network_up / network_down streams.
+        time_axis: "raster" or "sample", see module doc.
 
     Returns:
         DataFrame indexed 0..T-1 with columns
@@ -178,6 +191,8 @@ def load_mission(
         ValueError: if the overlapping time range is empty.
     """
     telemetry_dir = Path(telemetry_dir)
+    if time_axis not in TIME_AXES:
+        raise ValueError(f"time_axis must be one of {TIME_AXES}, got {time_axis!r}")
     if enabled_messages is None:
         enabled_messages = {k: True for k in MESSAGE_FEATURES}
 
@@ -216,6 +231,51 @@ def load_mission(
     if t_end <= t_start:
         raise ValueError(f"{mission_id}: empty overlapping time range")
 
+    if time_axis == "raster":
+        aligned = _align_raster(frames, t_start, t_end, period_ns)
+    else:
+        aligned = _align_samples(frames, t_start, t_end, period_ns)
+
+    feature_cols = get_feature_columns(enabled_messages)
+    aligned[feature_cols] = aligned[feature_cols].ffill().bfill()
+
+    if aligned[feature_cols].isna().any().any():
+        raise ValueError(f"{mission_id}: NaNs remain after fill")
+
+    if GPS_FIX_COL in aligned.columns:
+        fixed = np.flatnonzero(aligned[GPS_FIX_COL].to_numpy() >= GPS_FIX_3D)
+        if fixed.size == 0:
+            raise ValueError(f"{mission_id}: no 3D GPS fix")
+        aligned = aligned.iloc[fixed[0]:].reset_index(drop=True)
+
+    aligned = aligned.rename(columns={TIMESTAMP_COL: "t_ns"})
+    aligned[feature_cols] = aligned[feature_cols].astype(np.float32)
+    return aligned[["t_ns"] + feature_cols]
+
+
+def _feature_cols_of(df: pd.DataFrame, msg_type: str) -> list[str]:
+    return [TIMESTAMP_COL] + [c for c in df.columns if c.startswith(f"{msg_type}__")]
+
+
+def _align_raster(frames: dict[str, pd.DataFrame], t_start: int, t_end: int,
+                  period_ns: int) -> pd.DataFrame:
+    """Fixed host-clock grid, last received value of every message type.
+
+    t_start is the latest first timestamp over all types, so every type has
+    a sample at or before the first tick.
+    """
+    aligned = pd.DataFrame({TIMESTAMP_COL: np.arange(t_start, t_end + 1, period_ns,
+                                                     dtype=np.int64)})
+    for msg_type, df in frames.items():
+        aligned = pd.merge_asof(aligned, df[_feature_cols_of(df, msg_type)],
+                                on=TIMESTAMP_COL, direction="backward")
+    return aligned
+
+
+def _align_samples(frames: dict[str, pd.DataFrame], t_start: int, t_end: int,
+                   period_ns: int) -> pd.DataFrame:
+    """Sample-driven axis: reference type thinned to the target rate, other
+    types matched to the nearest sample within half a period."""
     ref_type = next(iter(frames))
     ref = frames[ref_type]
     ref = ref[(ref[TIMESTAMP_COL] >= t_start) & (ref[TIMESTAMP_COL] <= t_end)]
@@ -243,22 +303,7 @@ def load_mission(
             direction="nearest",
             tolerance=period_ns // 2,
         )
-
-    feature_cols = get_feature_columns(enabled_messages)
-    aligned[feature_cols] = aligned[feature_cols].ffill().bfill()
-
-    if aligned[feature_cols].isna().any().any():
-        raise ValueError(f"{mission_id}: NaNs remain after fill")
-
-    if GPS_FIX_COL in aligned.columns:
-        fixed = np.flatnonzero(aligned[GPS_FIX_COL].to_numpy() >= GPS_FIX_3D)
-        if fixed.size == 0:
-            raise ValueError(f"{mission_id}: no 3D GPS fix")
-        aligned = aligned.iloc[fixed[0]:].reset_index(drop=True)
-
-    aligned = aligned.rename(columns={TIMESTAMP_COL: "t_ns"})
-    aligned[feature_cols] = aligned[feature_cols].astype(np.float32)
-    return aligned[["t_ns"] + feature_cols]
+    return aligned
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,21 @@
+# === On-board view overlay ===
+# Telemetry recorded directly at the flight controller (SITL SERIAL2) and the
+# radio frames of the vehicle's own interface (wlan0), as an IDS on the
+# vehicle sees them. Recorded since normal dataset v3 and the
+# rf_jamming/frame_injection re-flight of 2026-11-03; v2 has the GCS view
+# only (telemetry/, network/). Convert the captures first with
+#   python3 data/pcap_to_csv.py --dataset ../dataset --onboard --clock-offset ... --manifest ...
+# The source is part of the cache key, so GCS and on-board caches never mix.
+#
+# Usage:
+#   cd training
+#   python train.py --experiment configs/onboard.yaml
+#   # other manifest, e.g. the attack data:
+#   python train.py --experiment configs/onboard.yaml data.mission_manifest=../dataset/<manifest>.csv
+
+data:
+  dataset_dir: "../dataset"
+  # merged manifest of v3 (both hosts), written when v3 is complete
+  mission_manifest: "${data.dataset_dir}/missions_manifest_v3_merged.csv"
+  telemetry_dir: "${data.dataset_dir}/telemetry_onboard"
+  network_dir: "${data.dataset_dir}/network_onboard"

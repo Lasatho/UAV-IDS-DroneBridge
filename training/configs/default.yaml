@@ -17,6 +17,10 @@ data:
   # 4 Hz = native telemetry rate of the SITL recordings (MAVProxy default
   # stream rate); higher values would only repeat samples.
   resample_freq_hz: 4  # Hz
+  # raster: fixed grid on the receiving host's clock, last value per channel
+  # (as on the vehicle; link losses stay visible). sample: rows follow the
+  # telemetry samples (until 2026-11-03; fallback if the key is missing).
+  time_axis: raster
 
   # Sliding window
   window_length: 64     # timesteps per sample

@@ -64,11 +64,27 @@ def split_missions(
 # Cached mission loading
 # ---------------------------------------------------------------------------
 
-def _cache_dir(dataset_dir: Path, resample_freq_hz: float, feature_cols: list[str]) -> Path:
-    """Cache directory keyed by frequency, feature set and preprocessing version."""
+def _cache_dir(dataset_dir: Path, resample_freq_hz: float, feature_cols: list[str],
+               time_axis: str = "sample", source: str = "") -> Path:
+    """Cache directory keyed by frequency, feature set, preprocessing version,
+    time axis and data source. The defaults ("sample", GCS view) leave the key
+    as it was before these options existed, so older caches stay valid."""
     key = "|".join(feature_cols) + f"|pre{PREPROCESSING_VERSION}"
+    if time_axis != "sample":
+        key += f"|{time_axis}"
+    if source:
+        key += f"|src={source}"
     feat_hash = hashlib.sha1(key.encode()).hexdigest()[:8]
     return Path(dataset_dir) / "cache" / f"{resample_freq_hz:g}hz_{feat_hash}"
+
+
+def _source_key(cfg: dict) -> str:
+    """Cache-key part for the data source: empty for the GCS view
+    (telemetry/, network/), else the two directory names, e.g. the on-board
+    view telemetry_onboard/ + network_onboard/."""
+    tel = Path(cfg["telemetry_dir"]).name
+    net = Path(cfg["network_dir"]).name if cfg.get("network_dir") else ""
+    return "" if (tel, net) in (("telemetry", "network"), ("telemetry", "")) else f"{tel},{net}"
 
 
 def load_mission_cached(
@@ -78,6 +94,7 @@ def load_mission_cached(
     resample_freq_hz: float,
     enabled_messages: dict[str, bool] | None,
     network_dir: Path | None = None,
+    time_axis: str = "sample",
 ) -> np.ndarray:
     """Aligned feature array (T, n_features) for one mission, via .npy cache."""
     cache_path = cache_dir / f"{mission_id}.npy"
@@ -90,6 +107,7 @@ def load_mission_cached(
         resample_freq_hz=resample_freq_hz,
         enabled_messages=enabled_messages,
         network_dir=network_dir,
+        time_axis=time_axis,
     )
     arr = df.drop(columns=["t_ns"]).to_numpy(dtype=np.float32)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -168,7 +186,9 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
     enabled = cfg.get("features")
     feature_cols = get_feature_columns(enabled)
     freq = float(cfg["resample_freq_hz"])
-    cache_dir = _cache_dir(dataset_dir, freq, feature_cols)
+    # Missing in configs from before 2026-11-03 (checkpoints): sample axis.
+    time_axis = cfg.get("time_axis", "sample")
+    cache_dir = _cache_dir(dataset_dir, freq, feature_cols, time_axis, _source_key(cfg))
     logger.info("Cache directory: %s", cache_dir)
 
     splits_path = cache_dir / "splits.json"
@@ -235,7 +255,7 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
             try:
                 arrs.append(
                     load_mission_cached(telemetry_dir, cache_dir, mid, freq,
-                                        enabled, network_dir)
+                                        enabled, network_dir, time_axis)
                 )
                 used.append(mid)
             except (ValueError, FileNotFoundError) as e:
