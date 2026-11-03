@@ -29,6 +29,9 @@ Wind Directions: N, NE, E, SE (0°, 45°, 90°, 135°)
 Usage:
     python3 generate_missions.py --output-dir ./dataset
     python3 generate_missions.py --output-dir ./dataset --dry-run  # only print count
+    # v3: the other three wind directions per v2 cell (v2 + v3 = full factorial)
+    python3 generate_missions.py --output-dir ./dataset --design complement \
+        --id-offset 50000 --manifest-name missions_manifest_v3.csv
 
 Mission ids start at --id-offset + 1 (default 30001) so v1 files
 (mission_00001..10752) and the attack set (mission_2xxxx) stay untouched.
@@ -513,20 +516,26 @@ PROFILES = {
 }
 
 
-def enumerate_all_missions():
+def enumerate_all_missions(shifts=(0,)):
     """
     profile × geometry × drone_preset × wind_profile, wind direction rotated
     (Latin square over geometry, preset and wind profile, see module doc).
+    For each shift s the direction index is (geometry + preset + wind + s)
+    mod 4; shift 0 is the v2 design, shifts 1-3 are the remaining
+    directions of every cell. The shift is the outer loop, so each block of
+    one shift is again a complete Latin square.
     Yields (profile, geometry_params, drone_preset_name, wind_profile_name, wind_direction).
     """
-    geo_idx = 0
-    for profile_name, geo_variants in PROFILES.items():
-        for geo_params in geo_variants:
-            for p_idx, preset_name in enumerate(DRONE_PRESETS):
-                for w_idx, wind_name in enumerate(WIND_PROFILES):
-                    wind_dir = WIND_DIRECTIONS[(geo_idx + p_idx + w_idx) % len(WIND_DIRECTIONS)]
-                    yield (profile_name, geo_params, preset_name, wind_name, wind_dir)
-            geo_idx += 1
+    for shift in shifts:
+        geo_idx = 0
+        for profile_name, geo_variants in PROFILES.items():
+            for geo_params in geo_variants:
+                for p_idx, preset_name in enumerate(DRONE_PRESETS):
+                    for w_idx, wind_name in enumerate(WIND_PROFILES):
+                        d_idx = (geo_idx + p_idx + w_idx + shift) % len(WIND_DIRECTIONS)
+                        yield (profile_name, geo_params, preset_name, wind_name,
+                               WIND_DIRECTIONS[d_idx])
+                geo_idx += 1
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +551,12 @@ def main():
     parser.add_argument("--id-offset", type=int, default=30000,
                         help="Mission ids start at offset + 1")
     parser.add_argument("--manifest-name", default="missions_manifest_v2.csv")
+    parser.add_argument("--design", choices=("v2", "complement"), default="v2",
+                        help="v2: one direction per cell (Latin square); complement: "
+                             "the three directions per cell not flown in v2, so v2 + "
+                             "complement is full factorial in wind profile x direction")
     args = parser.parse_args()
+    shifts = (0,) if args.design == "v2" else (1, 2, 3)
 
     # Count per profile
     print("=== Mission Count per Profile ===")
@@ -551,11 +565,11 @@ def main():
         n_geo = len(gvariants)
         n_full = n_geo * len(DRONE_PRESETS) * len(WIND_PROFILES)
         print(f"  {pname:12s}: {n_geo:4d} geometries × "
-              f"{len(DRONE_PRESETS)} presets × {len(WIND_PROFILES)} wind "
-              f"(direction rotated) = {n_full:6d} missions")
+              f"{len(DRONE_PRESETS)} presets × {len(WIND_PROFILES)} wind × "
+              f"{len(shifts)} direction(s) = {n_full * len(shifts):6d} missions")
         total_geo += n_geo
 
-    total = total_geo * len(DRONE_PRESETS) * len(WIND_PROFILES)
+    total = total_geo * len(DRONE_PRESETS) * len(WIND_PROFILES) * len(shifts)
     print(f"\n  Total geometries: {total_geo}")
     print(f"  Total missions: {total}")
 
@@ -586,7 +600,7 @@ def main():
         writer.writeheader()
 
         for mission_idx, (profile, geo, preset, wind, wind_dir) in enumerate(
-            enumerate_all_missions(), start=1
+            enumerate_all_missions(shifts), start=1
         ):
             mission_id = f"mission_{args.id_offset + mission_idx:05d}"
             wp_filename = f"{mission_id}.waypoints"
@@ -629,6 +643,7 @@ def main():
                     "wind_params": wind_info,
                     "wind_direction_deg": wind_dir,
                     "n_waypoints": len(wps),
+                    "design": args.design,
                     "home": {"lat": HOME_LAT, "lng": HOME_LNG, "alt": HOME_ALT},
                 }
                 with open(out / "meta" / f"{mission_id}_params.json", "w") as mf:
