@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only progress of an attack manifest with a remaining-time estimate.
+"""Read-only progress of a mission manifest (attack or normal, attack_type "none") with a remaining-time estimate.
 
 usage: attack_progress.py <repo> <manifest>
 Remaining time = for every pending mission the median recorded duration of
@@ -14,8 +14,8 @@ from pathlib import Path
 repo = Path(sys.argv[1]); ds = repo / "dataset"
 rows = list(csv.DictReader(open(ds / sys.argv[2] if "/" not in sys.argv[2] else sys.argv[2])))
 print("status", dict(Counter(r["status"] for r in rows)))
-print("completed per attack", dict(Counter(r["attack_type"] for r in rows if r["status"] == "completed")),
-      "of", dict(Counter(r["attack_type"] for r in rows)))
+print("completed per attack", dict(Counter(r.get("attack_type", "none") for r in rows if r["status"] == "completed")),
+      "of", dict(Counter(r.get("attack_type", "none") for r in rows)))
 lab = {}
 for r in rows:
     p = ds / "phase_labels" / f"{r['mission_id']}.json"
@@ -25,8 +25,8 @@ ends = sorted((L["start_time"], L["end_time"]) for L in lab.values())
 gaps = [b[0] - a[1] for a, b in zip(ends, ends[1:]) if 0 < b[0] - a[1] < 600]
 gap = statistics.median(gaps) if gaps else 84.0
 cells = [defaultdict(list) for _ in range(4)]
-keys = lambda r: [(r["attack_type"], r["drone_preset"], r["wind_profile"]),
-                  (r["attack_type"], r["drone_preset"]), (r["attack_type"],), ()]
+keys = lambda r: [(r.get("attack_type", "none"), r["drone_preset"], r["wind_profile"]),
+                  (r.get("attack_type", "none"), r["drone_preset"]), (r.get("attack_type", "none"),), ()]
 for r in rows:
     L = lab.get(r["mission_id"])
     if L and r["status"] == "completed":
