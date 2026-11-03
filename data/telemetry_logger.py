@@ -51,10 +51,13 @@ LOGGED_MESSAGES = {
 
 
 class TelemetryLogger:
-    def __init__(self, output_dir: Path, run_id: str, connection_string: str):
+    def __init__(self, output_dir: Path, run_id: str, connection_string: str,
+                 rate_hz: int = 50, extended_status: bool = False):
         self.output_dir = output_dir
         self.run_id = run_id
         self.connection_string = connection_string
+        self.rate_hz = rate_hz
+        self.extended_status = extended_status
         self.writers = {}
         self.files = {}
         self.keep_running = True
@@ -150,12 +153,16 @@ class TelemetryLogger:
         MAV_DATA_STREAM_POSITION covers GPS;
         MAV_DATA_STREAM_RC_CHANNELS covers servo outputs.
         """
-        rate_hz = 50
+        rate_hz = self.rate_hz
         streams = [
             mavutil.mavlink.MAV_DATA_STREAM_RAW_SENSORS,
             mavutil.mavlink.MAV_DATA_STREAM_POSITION,
             mavutil.mavlink.MAV_DATA_STREAM_RC_CHANNELS,
         ]
+        # ArduPilot sends GPS_RAW_INT in the EXTENDED_STATUS group. On the GCS
+        # link MAVProxy requests it; a direct SITL port needs the request.
+        if self.extended_status:
+            streams.append(mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS)
         for stream_id in streams:
             self.conn.mav.request_data_stream_send(
                 self.conn.target_system,
@@ -189,9 +196,20 @@ def main():
         "--run-id", default=time.strftime("run_%Y%m%d_%H%M%S"),
         help="Run identifier used as CSV filename prefix"
     )
+    parser.add_argument(
+        "--rate-hz", type=int, default=50,
+        help="Requested stream rate (default 50; MAVProxy overrides it to 4 Hz "
+             "on the GCS link, a direct SITL port keeps the requested rate)"
+    )
+    parser.add_argument(
+        "--extended-status", action="store_true",
+        help="Also request the EXTENDED_STATUS stream (GPS_RAW_INT), needed "
+             "on a direct SITL port without MAVProxy"
+    )
     args = parser.parse_args()
 
-    logger = TelemetryLogger(args.output, args.run_id, args.connection)
+    logger = TelemetryLogger(args.output, args.run_id, args.connection, args.rate_hz,
+                             args.extended_status)
 
     # Handle SIGTERM gracefully (for docker stop later)
     signal.signal(signal.SIGTERM, lambda *_: setattr(logger, "keep_running", False))

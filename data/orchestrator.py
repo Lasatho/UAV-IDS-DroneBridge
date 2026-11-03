@@ -168,6 +168,21 @@ CHILD_STOP_TIMEOUT_S = 15.0
 SITL_DIRECT_ATTACKS = {"gnss_spoofing", "gnss_jamming"}
 SITL_DIRECT_CONNECTION = "tcp:127.0.0.1:5762"
 
+# The IDS is meant to run on board, where telemetry comes straight from the
+# flight controller and never over the radio. A second logger records this
+# on-board view from SITL SERIAL2 (TCP 5763) into telemetry_onboard/; the
+# GCS view over DroneBridge and MAVProxy stays in telemetry/. 4 Hz like the
+# stream MAVProxy sets on the GCS link.
+ONBOARD_TELEMETRY_CONNECTION = "tcp:127.0.0.1:5763"
+ONBOARD_TELEMETRY_DIR = "telemetry_onboard"
+ONBOARD_TELEMETRY_RATE_HZ = 4
+# On-board radio view: what the vehicle's own interface (wlan0, db_uav)
+# sends and receives, with the received signal strength. pcap/ (hwsim0)
+# stays the medium-wide capture that sees every frame regardless of
+# reception.
+ONBOARD_PCAP_IFACE = "wlan0"
+ONBOARD_PCAP_DIR = "pcap_onboard"
+
 # ArduCopter reports a reached mission item twice: MISSION_ITEM_REACHED and
 # STATUSTEXT "Reached command #N".
 REACHED_RE = re.compile(r"Reached command #(\d+)")
@@ -226,6 +241,8 @@ class Orchestrator:
         # but ensure pcap/telemetry/phase_labels exist
         (output_dir / "pcap").mkdir(parents=True, exist_ok=True)
         (output_dir / "telemetry").mkdir(parents=True, exist_ok=True)
+        (output_dir / ONBOARD_TELEMETRY_DIR).mkdir(parents=True, exist_ok=True)
+        (output_dir / ONBOARD_PCAP_DIR).mkdir(parents=True, exist_ok=True)
         (output_dir / "phase_labels").mkdir(parents=True, exist_ok=True)
         (output_dir / "wind").mkdir(parents=True, exist_ok=True)
 
@@ -751,26 +768,27 @@ class Orchestrator:
                 return
         log.warning("[?] Timeout waiting for disarm")
 
-    def start_tcpdump(self, run_id: str) -> subprocess.Popen:
-        pcap_path = self.output_dir / "pcap" / f"{run_id}.pcap"
-        log.info(f"[+] Starting tcpdump -> {pcap_path}")
+    def start_tcpdump(self, run_id: str, iface="hwsim0", subdir="pcap") -> subprocess.Popen:
+        pcap_path = self.output_dir / subdir / f"{run_id}.pcap"
+        log.info(f"[+] Starting tcpdump ({iface}) -> {pcap_path}")
         return subprocess.Popen(
-            ["tcpdump", "-i", "hwsim0", "-w", str(pcap_path)],
+            ["tcpdump", "-i", iface, "-w", str(pcap_path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
 
-    def start_telemetry_logger(self, run_id: str) -> subprocess.Popen:
-        telemetry_dir = self.output_dir / "telemetry"
-        log.info(f"[+] Starting telemetry logger -> {telemetry_dir}")
-        return subprocess.Popen(
-            [
-                "python3", "telemetry_logger.py",
-                "--connection", "udpin:127.0.0.1:14553",
-                "--output", str(telemetry_dir),
-                "--run-id", run_id
-            ]
-        )
+    def start_telemetry_logger(self, run_id: str, connection="udpin:127.0.0.1:14553",
+                               subdir="telemetry", rate_hz=None) -> subprocess.Popen:
+        telemetry_dir = self.output_dir / subdir
+        log.info(f"[+] Starting telemetry logger ({connection}) -> {telemetry_dir}")
+        cmd = ["python3", "telemetry_logger.py",
+               "--connection", connection,
+               "--output", str(telemetry_dir),
+               "--run-id", run_id]
+        if rate_hz:
+            # direct SITL port: set the rate and request GPS_RAW_INT ourselves
+            cmd += ["--rate-hz", str(rate_hz), "--extended-status"]
+        return subprocess.Popen(cmd)
 
     def start_attack(self, attack_type: str, mission_id: str,
                      attack_variant: str = None) -> subprocess.Popen:
@@ -1262,6 +1280,13 @@ class Orchestrator:
                  self.output_dir / "wind" / f"{mission_id}_wind.csv",
                  self.output_dir / "phase_labels" / f"{mission_id}.json"]
         files += sorted((self.output_dir / "telemetry").glob(f"{mission_id}_*.csv"))
+        for sub, pattern in ((ONBOARD_TELEMETRY_DIR, f"{mission_id}_*.csv"),
+                             (ONBOARD_PCAP_DIR, f"{mission_id}.pcap")):
+            onboard = sorted((self.output_dir / sub).glob(pattern))
+            if onboard:
+                (dest / sub).mkdir(exist_ok=True)
+                for p in onboard:
+                    p.rename(dest / sub / p.name)
         for p in files:
             if p.exists():
                 p.rename(dest / p.name)
@@ -1288,7 +1313,11 @@ class Orchestrator:
 
         # Start capture
         tcpdump_proc = self.start_tcpdump(mission_id)
+        tcpdump_onboard_proc = self.start_tcpdump(mission_id, ONBOARD_PCAP_IFACE, ONBOARD_PCAP_DIR)
         telemetry_proc = self.start_telemetry_logger(mission_id)
+        onboard_proc = self.start_telemetry_logger(
+            mission_id, ONBOARD_TELEMETRY_CONNECTION, ONBOARD_TELEMETRY_DIR,
+            ONBOARD_TELEMETRY_RATE_HZ)
         time.sleep(1)
 
         start_time = time.time()
@@ -1415,7 +1444,9 @@ class Orchestrator:
             except Exception as e:
                 log.error(f"  Could not reset wind: {e}")
             stop_process(tcpdump_proc, "tcpdump")
+            stop_process(tcpdump_onboard_proc, "on-board tcpdump")
             stop_process(telemetry_proc, "telemetry logger")
+            stop_process(onboard_proc, "on-board telemetry logger")
             notes = ""
             if crashed_seeds:
                 notes = (f"re-flown with wind seed {wind_seed} after crash "
