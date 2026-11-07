@@ -20,6 +20,15 @@ Frame layout (R = radiotap length, 22 on hwsim0):
   Bytes R+10+:  Payload (cleartext MAVLink on port 1; the companion computer
                variant has no transport encryption)
 
+Frames without a valid DroneBridge header are skipped: FCF + Duration must
+be 0x08 0x00 0x00 0x00 and payload_len must match the frame length. This
+drops the random-content frames of the rf_jamming jammer, whose bytes would
+otherwise be read as header fields (decision 2026-11-07, finding 38).
+
+frame_len is given as on hwsim0 (radiotap length normalized to 22 bytes),
+so it does not depend on the capture interface: on wlan0 the radiotap
+header is shorter (13 bytes received, 18/26 own frames).
+
 Output CSV columns:
   host_timestamp_ns, timestamp_s, frame_len, direction, comm_id, port,
   payload_len, seq_num [, signal_dbm with --with-signal: radiotap
@@ -65,6 +74,11 @@ DB_HEADER_LEN = 10
 # header. This drops the 24-byte frames of the rf_jamming jammer, which carry
 # no DroneBridge header (decision 2026-11-02, variant a: keep them out).
 MIN_FRAME_SIZE = 32
+
+# DroneBridge raw frames start with FCF + Duration 0x08 0x00 0x00 0x00
+DB_FCF = b"\x08\x00\x00\x00"
+# Radiotap length on hwsim0; frame_len is normalized to it
+HWSIM_RADIOTAP_LEN = 22
 
 # Own transmitted frame repeated within this time = capture echo, dropped
 TX_ECHO_WINDOW_S = 0.05
@@ -152,15 +166,19 @@ def extract_db_fields(frame_bytes: bytes, orig_len: int, with_signal: bool = Fal
     r = struct.unpack_from("<H", frame_bytes, 2)[0]
     if len(frame_bytes) < r + DB_HEADER_LEN:
         return None
+    if frame_bytes[r:r + 4] != DB_FCF:
+        return None  # no DroneBridge frame (e.g. rf_jamming random content)
 
     direction = frame_bytes[r + OFFSET_DIRECTION]
     comm_id = frame_bytes[r + OFFSET_COMM_ID]
     port = frame_bytes[r + OFFSET_PORT]
     payload_len = struct.unpack_from("<H", frame_bytes, r + OFFSET_PAYLOAD_LEN)[0]
     seq_num = frame_bytes[r + OFFSET_SEQ_NUM]
+    if payload_len != orig_len - r - DB_HEADER_LEN:
+        return None  # header length field inconsistent with the frame
 
     fields = {
-        "frame_len": orig_len,
+        "frame_len": orig_len - r + HWSIM_RADIOTAP_LEN,
         "direction": direction,
         "comm_id": comm_id,
         "port": port,
