@@ -48,6 +48,8 @@ from .features import (
     MESSAGE_FEATURES,
     NETWORK_FILE,
     NETWORK_TYPES,
+    RADIO_TYPES,
+    UPLINK_TYPES,
     UPLINK_DIRECTION,
     TIMESTAMP_COL,
     TIMESTAMP_FIELDS,
@@ -194,7 +196,7 @@ def load_mission(
     if time_axis not in TIME_AXES:
         raise ValueError(f"time_axis must be one of {TIME_AXES}, got {time_axis!r}")
     if enabled_messages is None:
-        enabled_messages = {k: True for k in MESSAGE_FEATURES}
+        enabled_messages = {k: k not in RADIO_TYPES for k in MESSAGE_FEATURES}
 
     period_ns = int(1e9 / resample_freq_hz)
 
@@ -209,13 +211,21 @@ def load_mission(
         if not path.exists():
             raise FileNotFoundError(path)
 
-        wanted = {TIMESTAMP_COL, *TIMESTAMP_FIELDS[msg_type], *feats}
+        if msg_type in RADIO_TYPES:
+            if time_axis != "raster":
+                raise ValueError(f"{msg_type} needs time_axis raster")
+            wanted = {TIMESTAMP_COL, "direction", "port", "payload_len", "seq_num"}
+        else:
+            wanted = {TIMESTAMP_COL, *TIMESTAMP_FIELDS[msg_type], *feats}
         df = pd.read_csv(path, usecols=lambda c: c in wanted)
         if msg_type in NETWORK_TYPES:
             up = df["direction"] == UPLINK_DIRECTION
-            df = df[up if msg_type == "network_up" else ~up]
+            df = df[up if msg_type in UPLINK_TYPES else ~up]
             if df.empty:
                 raise ValueError(f"{mission_id}: no frames for {msg_type}")
+        if msg_type in RADIO_TYPES:
+            frames[msg_type] = _radio_frames(df, msg_type)
+            continue
         df = df.sort_values(TIMESTAMP_COL).drop_duplicates(
             subset=TIMESTAMP_COL, keep="last"
         )
@@ -267,9 +277,48 @@ def _align_raster(frames: dict[str, pd.DataFrame], t_start: int, t_end: int,
     aligned = pd.DataFrame({TIMESTAMP_COL: np.arange(t_start, t_end + 1, period_ns,
                                                      dtype=np.int64)})
     for msg_type, df in frames.items():
+        if msg_type in RADIO_TYPES:
+            aligned = _bin_radio(aligned, df, msg_type, period_ns)
+            continue
         aligned = pd.merge_asof(aligned, df[_feature_cols_of(df, msg_type)],
                                 on=TIMESTAMP_COL, direction="backward")
     return aligned
+
+
+def _radio_frames(df: pd.DataFrame, msg_type: str) -> pd.DataFrame:
+    """Per-frame values of a radio_* stream: payload bytes and the frames
+    lost before it (gap of seq_num mod 256 to the previous frame of the same
+    port, 0 for the first frame of a port)."""
+    df = df.sort_values(TIMESTAMP_COL, kind="stable")
+    step = df.groupby("port")["seq_num"].diff().fillna(1).to_numpy() % 256
+    lost = np.where(step == 0, 0, step - 1)
+    return pd.DataFrame({
+        TIMESTAMP_COL: df[TIMESTAMP_COL].to_numpy(np.int64),
+        f"{msg_type}__frames": 1.0,
+        f"{msg_type}__bytes": df["payload_len"].to_numpy(np.float64),
+        f"{msg_type}__payload_len_max": df["payload_len"].to_numpy(np.float64),
+        f"{msg_type}__seq_lost": lost.astype(np.float64),
+    })
+
+
+def _bin_radio(aligned: pd.DataFrame, df: pd.DataFrame, msg_type: str,
+               period_ns: int) -> pd.DataFrame:
+    """Sum (max for payload_len_max) of the frames in (t - period, t] for
+    every tick t; ticks without frames are 0."""
+    ticks = aligned[TIMESTAMP_COL].to_numpy(np.int64)
+    t = df[TIMESTAMP_COL].to_numpy(np.int64)
+    k = np.searchsorted(ticks, t, side="left")  # ticks[k-1] < t <= ticks[k]
+    ok = (k < len(ticks)) & (t > ticks[0] - period_ns)
+    k = k[ok]
+    out = aligned.copy()
+    for f in ("frames", "bytes", "seq_lost"):
+        col = f"{msg_type}__{f}"
+        out[col] = np.bincount(k, weights=df[col].to_numpy()[ok], minlength=len(ticks))
+    col = f"{msg_type}__payload_len_max"
+    mx = np.zeros(len(ticks))
+    np.maximum.at(mx, k, df[col].to_numpy()[ok])
+    out[col] = mx
+    return out
 
 
 def _align_samples(frames: dict[str, pd.DataFrame], t_start: int, t_end: int,

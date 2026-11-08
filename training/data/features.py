@@ -39,6 +39,18 @@ MESSAGE_FEATURES: dict[str, list[str]] = {
     "network_down": [
         "frame_len", "direction", "comm_id", "port", "payload_len", "seq_num",
     ],
+    # The same frames summarized per raster tick instead of the header
+    # fields of the last frame (time_axis "raster" only): frames and payload
+    # bytes received in (t - period, t], largest payload, and frames lost
+    # according to the DroneBridge sequence number (gaps of seq_num, mod
+    # 256, per port). An empty tick is 0, so missing traffic (rf_jamming) is
+    # visible; the last-value fill of network_* hides it.
+    "radio_up": [
+        "frames", "bytes", "payload_len_max", "seq_lost",
+    ],
+    "radio_down": [
+        "frames", "bytes", "payload_len_max", "seq_lost",
+    ],
 }
 
 # Streams read from {mission_id}_network.csv in the network directory,
@@ -46,7 +58,9 @@ MESSAGE_FEATURES: dict[str, list[str]] = {
 # else (0x03 = to the GCS, and frames that are no valid DroneBridge frame)
 # goes to the downlink stream so foreign frames stay visible.
 NETWORK_FILE = "network"
-NETWORK_TYPES = {"network_up", "network_down"}
+RADIO_TYPES = {"radio_up", "radio_down"}  # opt-in, not part of the default (None) set
+NETWORK_TYPES = {"network_up", "network_down"} | RADIO_TYPES
+UPLINK_TYPES = {"network_up", "radio_up"}
 UPLINK_DIRECTION = 1
 
 # Timestamp columns to drop per message type (not used as features)
@@ -58,6 +72,8 @@ TIMESTAMP_FIELDS: dict[str, list[str]] = {
     "SERVO_OUTPUT_RAW": ["time_usec"],
     "network_up": [],  # host clock only
     "network_down": [],
+    "radio_up": [],
+    "radio_down": [],
 }
 
 
@@ -75,7 +91,7 @@ def get_feature_columns(enabled_messages: dict[str, bool] | None = None) -> list
         List of prefixed feature column names in stable order.
     """
     if enabled_messages is None:
-        enabled_messages = {k: True for k in MESSAGE_FEATURES}
+        enabled_messages = {k: k not in RADIO_TYPES for k in MESSAGE_FEATURES}
 
     columns = []
     for msg_type, features in MESSAGE_FEATURES.items():
