@@ -31,6 +31,8 @@ echo "ground phase min/max: $(grep -o 'Ground phase sim/wall [0-9.]*' $O/orch_$H
 echo "start offset max: $(grep -o 'Start offset from spawn point [0-9.]*' $O/orch_$H.log | awk '{print $6}' | sort -n | tail -1)"
 echo "### degraded/crashed new"; find dataset/_degraded_runs dataset/_crashed_runs -maxdepth 1 -mindepth 1 -newermt "$SINCE" | sort
 echo "### attack check"; $PY -I $S/attack_check.py $R $M $OFF $O/${H}_attack.json "$SINCE"
+echo "### on-board view (re-flight 2026-11-03)"; $PY -I $S/onboard_check.py $R $(basename $M) $OFF $O/${H}_onboard.json "$SINCE"
+docker exec uav_ids_orchestrator md5sum /opt/orchestrator/telemetry_logger.py
 echo "### in-flight RTF (10-s windows > 3 m, sim/wall < 0.9)"; $PY -I $S/flight_rtf.py $R $M "$SINCE" 2>&1 | tail -30
 echo "### data check (sensor values, all completed attack missions; attack effects expected)"
 $PY -I $S/data_check.py $R $M $O/${H}_data.json > $O/${H}_data.txt 2>&1; head -40 $O/${H}_data.txt
