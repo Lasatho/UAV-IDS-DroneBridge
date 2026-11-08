@@ -25,6 +25,12 @@ be 0x08 0x00 0x00 0x00 and payload_len must match the frame length. This
 drops the random-content frames of the rf_jamming jammer, whose bytes would
 otherwise be read as header fields (decision 2026-11-07, finding 38).
 
+With --freq-mhz only frames on that radiotap channel frequency are kept.
+hwsim0 carries every channel; parallel simulation instances on one host use
+one channel each, so their GCS-view captures are separated this way (batch:
+--freq-from-labels takes radio_freq_mhz of the phase label, 2437 = channel 6
+if the label has none).
+
 frame_len is given as on hwsim0 (radiotap length normalized to 22 bytes),
 so it does not depend on the capture interface: on wlan0 the radiotap
 header is shorter (13 bytes received, 18/26 own frames).
@@ -104,6 +110,29 @@ def radiotap_signal_dbm(frame_bytes: bytes):
         pos = (pos + align - 1) // align * align
         if bit == 5:
             return struct.unpack_from("<b", frame_bytes, pos)[0] if pos < rt_len else None
+        pos += size
+    return None
+
+
+def radiotap_freq_mhz(frame_bytes: bytes):
+    """Channel frequency (MHz) of the radiotap header, None if absent."""
+    if len(frame_bytes) < 8:
+        return None
+    rt_len = struct.unpack_from("<H", frame_bytes, 2)[0]
+    present = struct.unpack_from("<I", frame_bytes, 4)[0]
+    if not present & (1 << 3):
+        return None
+    pos = 8
+    word = present
+    while word & (1 << 31):  # extended present bitmaps
+        word = struct.unpack_from("<I", frame_bytes, pos)[0]
+        pos += 4
+    for bit, align, size in _RT_FIELDS:
+        if not present & (1 << bit):
+            continue
+        pos = (pos + align - 1) // align * align
+        if bit == 3:
+            return struct.unpack_from("<H", frame_bytes, pos)[0] if pos + 2 <= rt_len else None
         pos += size
     return None
 
@@ -192,7 +221,7 @@ def extract_db_fields(frame_bytes: bytes, orig_len: int, with_signal: bool = Fal
 
 
 def convert_pcap(pcap_path: Path, output_path: Path, offset_ns: int = None,
-                 with_signal: bool = False):
+                 with_signal: bool = False, freq_mhz: int = None):
     """Convert a single PCAP to CSV; with offset_ns (epoch - monotonic of
     the capture host) also write host_timestamp_ns."""
     fieldnames = [
@@ -213,6 +242,9 @@ def convert_pcap(pcap_path: Path, output_path: Path, offset_ns: int = None,
         writer.writeheader()
 
         for timestamp_s, frame_bytes, orig_len in parse_pcap_frames(pcap_path):
+            if freq_mhz is not None and radiotap_freq_mhz(frame_bytes) != freq_mhz:
+                n_skipped += 1
+                continue
             fields = extract_db_fields(frame_bytes, orig_len, with_signal)
             if fields is None:
                 n_skipped += 1
@@ -252,9 +284,17 @@ def main():
                         help="batch with --manifest: only rows with this host column")
     parser.add_argument("--onboard", action="store_true",
                         help="batch: pcap_onboard/ (wlan0) -> network_onboard/, with signal_dbm")
+    parser.add_argument("--freq-mhz", type=int, default=None,
+                        help="keep only frames on this radiotap channel frequency")
+    parser.add_argument("--freq-from-labels", action="store_true",
+                        help="batch: frequency per mission from phase_labels/<id>.json "
+                             "(radio_freq_mhz, default 2437)")
     parser.add_argument("--with-signal", action="store_true",
                         help="add the signal_dbm column (implied by --onboard)")
     args = parser.parse_args()
+    if args.onboard and (args.freq_mhz or args.freq_from_labels):
+        parser.error("--freq-mhz/--freq-from-labels only for hwsim0 captures: own frames "
+                     "on wlan0 carry no channel field, the channel separates them anyway")
     offset_ns = None
     if args.clock_offset:
         offset_ns = int(json.loads(args.clock_offset.read_text())["epoch_minus_monotonic_ns"])
@@ -263,7 +303,8 @@ def main():
         # Single file mode
         output = args.output or args.pcap.with_suffix(".csv")
         print(f"Converting {args.pcap.name}...")
-        n_frames, n_skipped = convert_pcap(args.pcap, output, offset_ns, args.with_signal)
+        n_frames, n_skipped = convert_pcap(args.pcap, output, offset_ns, args.with_signal,
+                                           args.freq_mhz)
         print(f"  {n_frames} frames extracted, {n_skipped} skipped")
         print(f"  Output: {output}")
 
@@ -292,8 +333,12 @@ def main():
             mission_id = pcap_path.stem
             output_path = network_dir / f"{mission_id}_network.csv"
 
+            freq = args.freq_mhz
+            if args.freq_from_labels:
+                label = args.dataset / "phase_labels" / f"{mission_id}.json"
+                freq = int(json.loads(label.read_text()).get("radio_freq_mhz") or 2437)
             n_frames, n_skipped = convert_pcap(pcap_path, output_path, offset_ns,
-                                               args.onboard or args.with_signal)
+                                               args.onboard or args.with_signal, freq)
             total_frames += n_frames
             total_skipped += n_skipped
 

@@ -1,0 +1,127 @@
+# Additional simulation instance k on the same host (parallel runs).
+# Same images as docker-compose.yml; ports, radios, channel, Gazebo partition
+# and flag files come from simulation/instances/<k>.env. Instance 0 is the
+# stack of docker-compose.yml and stays unchanged.
+#
+#   bash simulation/start_instance.sh <k> <manifest>
+#
+# Separation (Vault simulation_parallelisierung): own three mac80211_hwsim
+# radios on their own channel (hwsim delivers frames only between radios on
+# the same channel), own SITL instance (-I k: ports 5760+10k.., JSON FDM
+# 9002+10k), own Gazebo partition, own DroneBridge/MAVProxy ports. hwsim0
+# sees every channel: the GCS-view pcap/ is separated by pcap_to_csv.py
+# --freq-from-labels (radio_freq_mhz in the phase label).
+name: uav_ids_${K}
+
+services:
+  gazebo:
+    image: simulation-gazebo
+    container_name: uav_ids_${K}_gazebo
+    privileged: true
+    network_mode: host
+    environment:
+      - GZ_SIM_SYSTEM_PLUGIN_PATH=/usr/local/lib/ardupilot_gazebo
+      - GZ_SIM_RESOURCE_PATH=/opt/ardupilot_gazebo/models:/opt/ardupilot_gazebo/worlds
+      - GZ_PARTITION=${GZ_PARTITION}
+      - GZ_IP=127.0.0.1
+      - LIBGL_ALWAYS_SOFTWARE=1
+      - MESA_LOADER_DRIVER_OVERRIDE=kms_swrast
+      - GALLIUM_DRIVER=llvmpipe
+    volumes:
+      - ./gazebo/worlds/iris_runway_wind.sdf:/opt/ardupilot_gazebo/worlds/iris_runway_wind.sdf:ro
+      # model with this instance's FDM port
+      - ./instances/iris_with_gimbal_fdm${FDM_PORT}.sdf:/opt/ardupilot_gazebo/models/iris_with_gimbal/model.sdf:ro
+    command: ["gz", "sim", "-s", "-r", "/opt/ardupilot_gazebo/worlds/iris_runway_wind.sdf"]
+    restart: unless-stopped
+
+  ardupilot:
+    image: simulation-ardupilot
+    container_name: uav_ids_${K}_ardupilot
+    privileged: true
+    network_mode: host
+    volumes:
+      - ./ardupilot/uav_ids.parm:/home/ardupilot/uav_ids.parm:ro
+    command:
+      - /home/ardupilot/ardupilot/build/sitl/bin/arducopter
+      - --model
+      - JSON
+      - --speedup
+      - "1"
+      - --defaults
+      - /home/ardupilot/ardupilot/Tools/autotest/default_params/copter.parm,/home/ardupilot/ardupilot/Tools/autotest/default_params/gazebo-iris.parm,/home/ardupilot/uav_ids.parm
+      - --sim-address=127.0.0.1
+      - -I${K}
+    depends_on:
+      - gazebo
+    restart: unless-stopped
+
+  dronebridge_gcs:
+    image: simulation-dronebridge_gcs
+    container_name: uav_ids_${K}_db_gcs
+    privileged: true
+    network_mode: host
+    command: /opt/dronebridge/db_proxy -n ${IF_GCS} -m m -c 200 -p ${DB_GCS_PORT} -d 1
+    depends_on:
+      - ardupilot
+    restart: unless-stopped
+
+  dronebridge_uav:
+    image: simulation-dronebridge_uav
+    container_name: uav_ids_${K}_db_uav
+    privileged: true
+    network_mode: host
+    command: /opt/dronebridge/db_proxy -n ${IF_DRONE} -m m -c 200 -p ${DB_UAV_PORT} -d 3
+    depends_on:
+      - ardupilot
+    restart: unless-stopped
+
+  socat:
+    image: alpine/socat
+    container_name: uav_ids_${K}_socat
+    network_mode: host
+    command: -d TCP:127.0.0.1:${DB_UAV_PORT},retry=30,interval=2 TCP:127.0.0.1:${SITL_SERIAL0},retry=30,interval=2
+    depends_on:
+      - ardupilot
+      - dronebridge_uav
+    restart: unless-stopped
+
+  mavproxy:
+    image: simulation-mavproxy
+    container_name: uav_ids_${K}_mavproxy
+    network_mode: host
+    command: >
+      mavproxy.py
+      --master=tcp:127.0.0.1:${DB_GCS_PORT}
+      --out=udp:127.0.0.1:${MAV_OUT_ORCH}
+      --out=udp:127.0.0.1:${MAV_OUT_LOGGER}
+      --out=udp:127.0.0.1:${MAV_OUT_SPARE}
+      --non-interactive
+    depends_on:
+      - dronebridge_gcs
+    restart: unless-stopped
+
+  orchestrator:
+    image: simulation-orchestrator
+    container_name: uav_ids_${K}_orchestrator
+    privileged: true
+    network_mode: host
+    environment:
+      - NTFY_TOPIC=uav-ids-lasse
+      - GZ_PARTITION=${GZ_PARTITION}
+      - GZ_IP=127.0.0.1
+      - UAV_IDS_INSTANCE=${K}
+      - SITL_DIRECT_CONNECTION=tcp:127.0.0.1:${SITL_SERIAL1}
+      - ONBOARD_TELEMETRY_CONNECTION=tcp:127.0.0.1:${SITL_SERIAL2}
+      - GCS_TELEMETRY_CONNECTION=udpin:127.0.0.1:${MAV_OUT_LOGGER}
+      - GCS_PCAP_IFACE=hwsim0
+      - ONBOARD_PCAP_IFACE=${IF_DRONE}
+      - ATTACK_IFACE=${IF_ATTACK}
+      - RADIO_FREQ_MHZ=${FREQ_MHZ}
+    volumes:
+      - ${REPO_ROOT}/dataset:/data
+      # instance-capable orchestrator (frozen copy, md5 in the start log)
+      - ${ORCH_PY}:/opt/orchestrator/orchestrator.py:ro
+    command: python3 orchestrator.py --manifest /data/${MANIFEST} --output /data --connection udpin:127.0.0.1:${MAV_OUT_ORCH}
+    depends_on:
+      - mavproxy
+    restart: unless-stopped
