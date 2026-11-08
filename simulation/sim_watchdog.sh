@@ -42,8 +42,13 @@
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="$REPO_ROOT/dataset/${MANIFEST:-missions_manifest.csv}"
-FLAG="$REPO_ROOT/dataset/.stop_orchestrator"
-PAUSE="$REPO_ROOT/dataset/.pause_orchestrator"
+# Parallel instances (simulation/docker-compose.instance.yml): container
+# prefix, flag suffix and radio interfaces of instance k; defaults = instance 0.
+PREFIX=${UAV_IDS_PREFIX:-uav_ids}
+FLAG_SUFFIX=${FLAG_SUFFIX:-}
+read -r -a IFACES <<< "${RADIO_IFACES:-wlan0 wlan1 wlan2}"
+FLAG="$REPO_ROOT/dataset/.stop_orchestrator$FLAG_SUFFIX"
+PAUSE="$REPO_ROOT/dataset/.pause_orchestrator$FLAG_SUFFIX"
 SAMPLOG=${SAMPLOG:-~/sim_degradation.log}
 WDLOG=${WDLOG:-~/sim_watchdog.log}
 NTFY_TOPIC=${NTFY_TOPIC:-}
@@ -56,9 +61,9 @@ DOWN_GRACE_S=120
 STALL_S=1800         # > longest silent phase: RTL from ~2.9 km at 3 m/s (~970 s), attack timeout 600 s
 MAX_RESTARTS_PER_H=4
 
-SIM=(uav_ids_gazebo uav_ids_ardupilot)
-LINK=(uav_ids_db_uav uav_ids_db_gcs uav_ids_mavproxy)
-ORCH=uav_ids_orchestrator
+SIM=(${PREFIX}_gazebo ${PREFIX}_ardupilot)
+LINK=(${PREFIX}_db_uav ${PREFIX}_db_gcs ${PREFIX}_mavproxy)
+ORCH=${PREFIX}_orchestrator
 
 log(){ echo "$(date "+%F %T") $*" >> "$WDLOG"; }
 notify(){
@@ -68,7 +73,7 @@ running(){ [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "tru
 
 interfaces_ok(){
   local i
-  for i in wlan0 wlan1 wlan2; do
+  for i in "${IFACES[@]}"; do
     iw dev "$i" info 2>/dev/null | grep -q "type monitor" || return 1
   done
 }
@@ -152,7 +157,7 @@ while true; do
   # 3. MAVProxy main loop died (process and container stay up)
   since=$mavproxy_checked
   mavproxy_checked=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  if docker logs --since "$since" uav_ids_mavproxy 2>&1 | grep -q "Exception in thread main_loop"; then
+  if docker logs --since "$since" ${PREFIX}_mavproxy 2>&1 | grep -q "Exception in thread main_loop"; then
     full_restart "MAVProxy main loop died"; continue
   fi
 
@@ -185,7 +190,7 @@ while true; do
         for (i = 1; i <= NF; i++) { if ($i == "NA") na++; else if ($i < t) low++ }
         print NF, low + 0, na + 0 }')"
     # 6. gazebo not answering
-    if [ "$n" -eq "$RTF_SAMPLES" ] && [ "$na" -eq "$RTF_SAMPLES" ] && running uav_ids_gazebo; then
+    if [ "$n" -eq "$RTF_SAMPLES" ] && [ "$na" -eq "$RTF_SAMPLES" ] && running ${PREFIX}_gazebo; then
       full_restart "gazebo stats not answering ($RTF_SAMPLES samples NA)"; continue
     fi
     if [ "$n" -eq "$RTF_SAMPLES" ] && [ "$low" -eq "$RTF_SAMPLES" ]; then

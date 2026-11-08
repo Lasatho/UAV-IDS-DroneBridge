@@ -181,6 +181,27 @@ ONBOARD_TELEMETRY_RATE_HZ = 4
 # stays the medium-wide capture that sees every frame regardless of
 # reception.
 ONBOARD_PCAP_IFACE = "wlan0"
+
+# Parallel simulation instances on one host (simulation/docker-compose.instance.yml,
+# Vault simulation_parallelisierung): each instance has its own SITL ports, its
+# own three radios on its own channel, its own MAVProxy outputs and flag files.
+# Configured through the environment; the defaults are the single-instance
+# values, so without these variables nothing changes.
+INSTANCE = os.environ.get("UAV_IDS_INSTANCE", "")
+SITL_DIRECT_CONNECTION = os.environ.get("SITL_DIRECT_CONNECTION", SITL_DIRECT_CONNECTION)
+ONBOARD_TELEMETRY_CONNECTION = os.environ.get("ONBOARD_TELEMETRY_CONNECTION",
+                                              ONBOARD_TELEMETRY_CONNECTION)
+ONBOARD_PCAP_IFACE = os.environ.get("ONBOARD_PCAP_IFACE", ONBOARD_PCAP_IFACE)
+# hwsim0 carries the frames of every channel; with parallel instances the
+# GCS-view pcap/ is separated afterwards by the radiotap channel
+# (pcap_to_csv.py --freq-mhz), whose value is written into the phase label.
+GCS_PCAP_IFACE = os.environ.get("GCS_PCAP_IFACE", "hwsim0")
+GCS_TELEMETRY_CONNECTION = os.environ.get("GCS_TELEMETRY_CONNECTION", "udpin:127.0.0.1:14553")
+ATTACK_IFACE = os.environ.get("ATTACK_IFACE", "")
+RADIO_FREQ_MHZ = int(os.environ.get("RADIO_FREQ_MHZ", "2437"))
+FLAG_SUFFIX = f"_{INSTANCE}" if INSTANCE else ""
+PAUSE_FLAG = ".pause_orchestrator" + FLAG_SUFFIX
+STOP_FLAG = ".stop_orchestrator" + FLAG_SUFFIX
 ONBOARD_PCAP_DIR = "pcap_onboard"
 
 # ArduCopter reports a reached mission item twice: MISSION_ITEM_REACHED and
@@ -768,7 +789,7 @@ class Orchestrator:
                 return
         log.warning("[?] Timeout waiting for disarm")
 
-    def start_tcpdump(self, run_id: str, iface="hwsim0", subdir="pcap") -> subprocess.Popen:
+    def start_tcpdump(self, run_id: str, iface=GCS_PCAP_IFACE, subdir="pcap") -> subprocess.Popen:
         pcap_path = self.output_dir / subdir / f"{run_id}.pcap"
         log.info(f"[+] Starting tcpdump ({iface}) -> {pcap_path}")
         return subprocess.Popen(
@@ -777,7 +798,7 @@ class Orchestrator:
             stderr=subprocess.DEVNULL
         )
 
-    def start_telemetry_logger(self, run_id: str, connection="udpin:127.0.0.1:14553",
+    def start_telemetry_logger(self, run_id: str, connection=GCS_TELEMETRY_CONNECTION,
                                subdir="telemetry", rate_hz=None) -> subprocess.Popen:
         telemetry_dir = self.output_dir / subdir
         log.info(f"[+] Starting telemetry logger ({connection}) -> {telemetry_dir}")
@@ -797,6 +818,8 @@ class Orchestrator:
         cmd = ["python3", str(script), "--mission-id", mission_id]
         if attack_type in SITL_DIRECT_ATTACKS:
             cmd += ["--connection", SITL_DIRECT_CONNECTION]
+        elif ATTACK_IFACE:
+            cmd += ["--interface", ATTACK_IFACE]
         if attack_variant:
             cmd += ["--variant", attack_variant]
         log.info(f"[!] Starting attack: {attack_type}"
@@ -1098,6 +1121,8 @@ class Orchestrator:
             "landed_by_orchestrator": flight.get("landed_by_orchestrator", False),
             "flipped_disarmed": flight.get("flipped_disarmed", False),
             "wind": wind,
+            "instance": INSTANCE or None,
+            "radio_freq_mhz": RADIO_FREQ_MHZ,
             "notes": notes
         }
         label_path = self.output_dir / "phase_labels" / f"{run_id}.json"
@@ -1231,7 +1256,7 @@ class Orchestrator:
                 log.error("No vehicle heartbeat after reboot — stopping.")
                 notify("[UAV-IDS] No vehicle heartbeat after reboot — stopping.")
                 self.keep_running = False
-                (self.output_dir / ".stop_orchestrator").touch()
+                (self.output_dir / STOP_FLAG).touch()
                 return
         log.info(f"[+] SITL rebooted, heartbeat OK "
                  f"(sys {self.conn.target_system}:{self.conn.target_component}).")
@@ -1505,7 +1530,7 @@ class Orchestrator:
                         notify("[UAV-IDS] 5 consecutive failures — stopping orchestrator.")
                         log.error("5 consecutive failures — stopping.")
                         self.keep_running = False
-                        (self.output_dir / ".stop_orchestrator").touch()
+                        (self.output_dir / STOP_FLAG).touch()
 
             # After a degraded run the SITL is rebooted on resume instead
             if self.keep_running and not degraded:
@@ -1538,10 +1563,10 @@ class Orchestrator:
     def run(self):
         """Iterate manifest, skip completed/failed, run pending missions."""
         
-        stop_flag = self.output_dir / ".stop_orchestrator"
+        stop_flag = self.output_dir / STOP_FLAG
         if stop_flag.exists():
             log.error("Stop flag found — previous run had 5 consecutive failures. "
-                      "Delete .stop_orchestrator to resume.")
+                      f"Delete {STOP_FLAG} to resume.")
             notify("[UAV-IDS] Stop flag present — orchestrator not starting.")
             return
         
