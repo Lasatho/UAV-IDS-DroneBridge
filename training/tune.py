@@ -94,13 +94,17 @@ def _rssm_space(trial: optuna.Trial) -> dict:
             # free_nats ~2.9 (upper edges); the stage-1 limits were never
             # checked against the GPS placeholder artefact. All upper bounds
             # opened one step to find where the range really ends.
+            # Study rssm_v2r (raster): best 5 all at deterministic 2048, 4 of 5 at
+            # hidden 512 (upper edges): deterministic 3072/4096 and hidden
+            # 768/1024 added (study rssm_v2r_ext with warm start; benchmark
+            # 2026-11-08: 4096/1024 peaks at 2.5 GiB, ~3x the step time of 2048/512).
             "lr": trial.suggest_float("lr", 1e-4, 5e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
         },
         "model": {
             "rssm": {
-                "hidden_dim": trial.suggest_categorical("hidden_dim", [32, 64, 128, 256, 512]),
-                "deterministic_dim": trial.suggest_categorical("deterministic_dim", [128, 256, 512, 1024, 2048]),
+                "hidden_dim": trial.suggest_categorical("hidden_dim", [32, 64, 128, 256, 512, 768, 1024]),
+                "deterministic_dim": trial.suggest_categorical("deterministic_dim", [128, 256, 512, 1024, 2048, 3072, 4096]),
                 "kl_dyn_beta": trial.suggest_float("kl_dyn_beta", 0.1, 1.5, log=True),
                 "free_nats": trial.suggest_float("free_nats", 0.5, 6.0),
             }
@@ -117,13 +121,16 @@ def _mts_jepa_space(trial: optuna.Trial) -> dict:
             # Study mts_jepa_v2b: best 5 all at depth 14 (upper edge, opened to
             # 20, sampled as an ordered integer); lr upper bound opened to 5e-3.
             # Study mts_jepa_v2c: best at depth 20 (upper edge, opened to 28).
+            # Study mts_jepa_v2r: best 5 all at embed_dim 256, 2 of 5 at depth 28
+            # (upper edges): embed_dim 384 added, depth opened to 36. 512 does not
+            # fit next to the running rssm_v2r workers (memory test 2026-11-07).
             "lr": trial.suggest_float("lr", 5e-5, 5e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
         },
         "model": {
             "mts_jepa": {
-                "embed_dim": trial.suggest_categorical("embed_dim", [64, 128, 256]),
-                "depth": trial.suggest_int("depth", 4, 28, step=2),
+                "embed_dim": trial.suggest_categorical("embed_dim", [64, 128, 256, 384]),
+                "depth": trial.suggest_int("depth", 4, 36, step=2),
                 "predictor_depth": trial.suggest_categorical("predictor_depth", [1, 2]),
             }
         },
