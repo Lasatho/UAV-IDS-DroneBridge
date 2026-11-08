@@ -1,0 +1,9 @@
+# Parameters on top of the SITL defaults (copter.parm, gazebo-iris.parm),
+# mounted into the ardupilot container and passed as third --defaults file.
+#
+# GCS failsafe: RTL when no heartbeat of the GCS (SYSID_MYGCS 255, sent by
+# MAVProxy over the DroneBridge link) arrived for FS_GCS_TIMEOUT (5 s,
+# default). ArduCopter's default is 0 (disabled): the vehicle then kept
+# flying its mission under rf_jamming. FS_OPTIONS stays at its default
+# (16), i.e. no 'continue in Auto' on GCS failsafe.
+FS_GCS_ENABLE 1

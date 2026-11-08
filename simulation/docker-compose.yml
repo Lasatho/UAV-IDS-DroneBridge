@@ -21,6 +21,20 @@ services:
     container_name: uav_ids_ardupilot
     privileged: true
     network_mode: host
+    # Dockerfile CMD plus a third defaults file (GCS failsafe), mounted so it
+    # can change without rebuilding the image
+    volumes:
+      - ./ardupilot/uav_ids.parm:/home/ardupilot/uav_ids.parm:ro
+    command:
+      - /home/ardupilot/ardupilot/build/sitl/bin/arducopter
+      - --model
+      - JSON
+      - --speedup
+      - "1"
+      - --defaults
+      - /home/ardupilot/ardupilot/Tools/autotest/default_params/copter.parm,/home/ardupilot/ardupilot/Tools/autotest/default_params/gazebo-iris.parm,/home/ardupilot/uav_ids.parm
+      - --sim-address=127.0.0.1
+      - -I0
     depends_on:
       - gazebo
     restart: unless-stopped
