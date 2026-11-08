@@ -65,6 +65,8 @@ PREPROCESSING_VERSION = 2
 TIME_AXES = ("raster", "sample")
 GPS_FIX_COL = "GPS_RAW_INT__fix_type"
 GPS_FIX_3D = 3
+COUNT_STD_FLOOR = 1.0
+RADIO_PREFIXES = tuple(f"{t}__" for t in sorted(RADIO_TYPES))
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +372,14 @@ class Normalizer:
         self.mean = mean.astype(np.float32)
         std = std.astype(np.float32)
         # Constant features (std == 0) are mapped to 0 instead of NaN.
-        self.std = np.where(std < 1e-12, 1.0, std)
+        std = np.where(std < 1e-12, 1.0, std)
+        # Count streams (radio_*: frames, bytes, payload_len_max, seq_lost):
+        # standard deviation at least one unit (1 frame / 1 byte), so a single
+        # lost or extra frame is at most 1 sigma even where it is rare in the
+        # normal data (decision 2026-11-08; log1p was rejected).
+        floor = np.array([COUNT_STD_FLOOR if c.startswith(RADIO_PREFIXES) else 0.0
+                          for c in columns], dtype=np.float32)
+        self.std = np.maximum(std, floor)
         self.columns = columns
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
