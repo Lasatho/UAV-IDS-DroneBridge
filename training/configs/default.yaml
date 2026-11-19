@@ -21,6 +21,10 @@ data:
   # (as on the vehicle; link losses stay visible). sample: rows follow the
   # telemetry samples (until 2026-11-03; fallback if the key is missing).
   time_axis: raster
+  # Position: abs (lat/lon as recorded), diff (change per step, north/east
+  # in m) or rel_ekf (GPS minus EKF position, north/east in m); see
+  # data/preprocessing.py. Decision 2026-11-09: diff for the retraining.
+  position_repr: abs
 
   # Sliding window
   window_length: 64     # timesteps per sample

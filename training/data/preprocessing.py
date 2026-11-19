@@ -33,6 +33,17 @@ Design decisions:
   the RSSM KL spikes of tuning study rssm_v2 (Befund in training_runs_4hz
   9.1). Only leading rows: a fix lost later in flight (GNSS jamming) is
   data and stays.
+- Position representation (opt-in, default "abs"): "diff" replaces lat/lon
+  of GPS_RAW_INT and GLOBAL_POSITION_INT by the change per timestep, north
+  and east in metres; "rel_ekf" replaces the GPS lat/lon by the offset to
+  the EKF position (GLOBAL_POSITION_INT), north and east in metres;
+  "rel_start" replaces the lat/lon of both by north/east in metres relative
+  to the first valid EKF position of the mission (same origin for both, so
+  GPS - EKF is kept; leading rows without an EKF position are dropped). In
+  absolute 1e-7 degrees a GNSS spoofing offset of ~30 m is ~0.1 sigma of
+  the flight area and invisible (Vault bewertung_ids_explorativ, decision
+  2026-11-09: "diff" for training, "rel_ekf" as ablation). Column names
+  stay the same; the cache key contains the representation.
 """
 
 from __future__ import annotations
@@ -66,6 +77,9 @@ TIME_AXES = ("raster", "sample")
 GPS_FIX_COL = "GPS_RAW_INT__fix_type"
 GPS_FIX_3D = 3
 COUNT_STD_FLOOR = 1.0
+POSITION_REPRS = ("abs", "diff", "rel_ekf", "rel_start")
+POSITION_MSGS = ("GPS_RAW_INT", "GLOBAL_POSITION_INT")
+M_PER_DEG = 111_320.0  # metres per degree of latitude (spherical earth)
 RADIO_PREFIXES = tuple(f"{t}__" for t in sorted(RADIO_TYPES))
 
 
@@ -162,6 +176,7 @@ def load_mission(
     enabled_messages: dict[str, bool] | None = None,
     network_dir: str | Path | None = None,
     time_axis: str = "sample",
+    position_repr: str = "abs",
 ) -> pd.DataFrame:
     """Load one mission and align all message types onto a common time axis.
 
@@ -184,6 +199,7 @@ def load_mission(
             (pcap frames, host_timestamp_ns on the telemetry clock), source
             of the network_up / network_down streams.
         time_axis: "raster" or "sample", see module doc.
+        position_repr: "abs", "diff" or "rel_ekf", see module doc.
 
     Returns:
         DataFrame indexed 0..T-1 with columns
@@ -197,6 +213,8 @@ def load_mission(
     telemetry_dir = Path(telemetry_dir)
     if time_axis not in TIME_AXES:
         raise ValueError(f"time_axis must be one of {TIME_AXES}, got {time_axis!r}")
+    if position_repr not in POSITION_REPRS:
+        raise ValueError(f"position_repr must be one of {POSITION_REPRS}, got {position_repr!r}")
     if enabled_messages is None:
         enabled_messages = {k: k not in RADIO_TYPES for k in MESSAGE_FEATURES}
 
@@ -260,9 +278,56 @@ def load_mission(
             raise ValueError(f"{mission_id}: no 3D GPS fix")
         aligned = aligned.iloc[fixed[0]:].reset_index(drop=True)
 
+    if position_repr == "rel_start":
+        e = POSITION_MSGS[1]
+        if f"{e}__lat" not in aligned.columns:
+            raise ValueError("position_repr rel_start needs GLOBAL_POSITION_INT")
+        valid = np.flatnonzero((aligned[f"{e}__lat"].to_numpy() != 0) & (aligned[f"{e}__lon"].to_numpy() != 0))
+        if valid.size == 0:
+            raise ValueError(f"{mission_id}: no EKF position")
+        aligned = aligned.iloc[valid[0]:].reset_index(drop=True)
+
+    # Before the float32 cast: lat/lon in 1e-7 degrees only resolve ~0.4 m there.
+    _apply_position_repr(aligned, position_repr)
+
     aligned = aligned.rename(columns={TIMESTAMP_COL: "t_ns"})
     aligned[feature_cols] = aligned[feature_cols].astype(np.float32)
     return aligned[["t_ns"] + feature_cols]
+
+
+def _north_east_m(dlat: np.ndarray, dlon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Differences of lat/lon (1e-7 degrees) as north/east in metres at latitude lat."""
+    k = 1e-7 * M_PER_DEG
+    return dlat * k, dlon * k * np.cos(np.deg2rad(lat * 1e-7))
+
+
+def _apply_position_repr(aligned: pd.DataFrame, position_repr: str) -> None:
+    """Rewrite the lat/lon columns in place, see module doc."""
+    if position_repr == "diff":
+        for msg in POSITION_MSGS:
+            la, lo = f"{msg}__lat", f"{msg}__lon"
+            if la not in aligned.columns:
+                continue
+            lat = aligned[la].to_numpy(np.float64)
+            lon = aligned[lo].to_numpy(np.float64)
+            aligned[la], aligned[lo] = _north_east_m(
+                np.diff(lat, prepend=lat[:1]), np.diff(lon, prepend=lon[:1]), lat)
+    elif position_repr == "rel_ekf":
+        g, e = POSITION_MSGS
+        cols = [f"{g}__lat", f"{g}__lon", f"{e}__lat", f"{e}__lon"]
+        if not all(c in aligned.columns for c in cols):
+            raise ValueError("position_repr rel_ekf needs GPS_RAW_INT and GLOBAL_POSITION_INT")
+        glat, glon, elat, elon = (aligned[c].to_numpy(np.float64) for c in cols)
+        aligned[cols[0]], aligned[cols[1]] = _north_east_m(glat - elat, glon - elon, elat)
+    elif position_repr == "rel_start":
+        e = POSITION_MSGS[1]
+        lat0 = float(aligned[f"{e}__lat"].iloc[0]); lon0 = float(aligned[f"{e}__lon"].iloc[0])
+        for msg in POSITION_MSGS:
+            la, lo = f"{msg}__lat", f"{msg}__lon"
+            if la not in aligned.columns:
+                continue
+            lat = aligned[la].to_numpy(np.float64); lon = aligned[lo].to_numpy(np.float64)
+            aligned[la], aligned[lo] = _north_east_m(lat - lat0, lon - lon0, np.full_like(lat, lat0))
 
 
 def _feature_cols_of(df: pd.DataFrame, msg_type: str) -> list[str]:

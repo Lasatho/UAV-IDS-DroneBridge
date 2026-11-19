@@ -19,3 +19,12 @@ data:
   mission_manifest: "${data.dataset_dir}/missions_manifest_v3_merged.csv"
   telemetry_dir: "${data.dataset_dir}/telemetry_onboard"
   network_dir: "${data.dataset_dir}/network_onboard"
+  # Radio stream summarized per raster tick (radio_*) instead of the header fields of the last frame (network_*):
+  # on the 4 Hz grid network_* keeps only the last frame of each tick (downlink 28-55 % of the frames never reach the
+  # model, missions 30001-30005) and repeats it when no frame arrives. Decided for the v3 retraining (Lasse
+  # 2026-11-08, Vault training_runs_4hz 9.21); 45 columns.
+  features:
+    network_up: false
+    network_down: false
+    radio_up: true
+    radio_down: true

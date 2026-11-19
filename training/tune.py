@@ -18,6 +18,11 @@ epochs. A schedule compressed to the trial length would anneal the LR to
 ~0 within the trial, hide instabilities that appear at high LR and tune
 the LR for a regime the full run never sees.
 
+--objective composite (decided 2026-11-11, Vault modellumbau_rssm_mtsjepa): instead of the mean
+anomaly score, J = (a + b + c) / 3 from tune_metric.py on fixed normal validation windows (normalized
+prediction error, information content of the representation, AUC over a generic disturbance catalogue);
+the raw scores and losses are unsuitable (MTS-JEPA: smallest when the targets collapse).
+
 Diagnostics stored per trial (user attrs, not part of the ranking):
 per-epoch maxima of the training_step outputs and the gradient norm
 (RSSM KL stability), and for MTS-JEPA the effective rank of the target
@@ -71,7 +76,9 @@ import torch.nn.functional as F
 from config import load_config, set_seed
 from data import build_dataloaders, get_num_features
 from models import build_model
-from train import MetricLogger, train_one_epoch
+from train import MetricLogger, train_one_epoch, prepare_model_cfg
+import tune_metric
+from data import get_feature_columns
 
 logger = logging.getLogger("tune")
 
@@ -137,7 +144,53 @@ def _mts_jepa_space(trial: optuna.Trial) -> dict:
     }
 
 
+def _rssm_space_v3(trial: optuna.Trial) -> dict:
+    """Tuning v3 (decision Lasse 2026-11-10, Vault modellumbau_rssm_mtsjepa "Entscheidungen vor dem Tuning"):
+    sizes not beyond the previous edges (Jetson; the rssm_v2r_ext values 3072/4096 and 768/1024 were never run
+    and are dropped), new: share of group masking. Structural choices (position_repr, window_relative,
+    hidden_base, loss_weight, predict_increment) are fixed per study with --set."""
+    return {
+        "training": {
+            "lr": trial.suggest_float("lr", 1e-4, 5e-3, log=True),
+            "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
+        },
+        "model": {
+            "rssm": {
+                "hidden_dim": trial.suggest_categorical("hidden_dim", [128, 256, 512]),
+                "deterministic_dim": trial.suggest_categorical("deterministic_dim", [512, 1024, 2048]),
+                "kl_dyn_beta": trial.suggest_float("kl_dyn_beta", 0.1, 1.5, log=True),
+                "free_nats": trial.suggest_float("free_nats", 0.5, 6.0),
+                "group_mask_prob": trial.suggest_float("group_mask_prob", 0.1, 0.5),
+            }
+        },
+    }
+
+
+def _mts_jepa_space_v3(trial: optuna.Trial) -> dict:
+    """Tuning v3 (decision 2026-11-10): sizes as before (embed_dim up to 384, depth up to 36), new: shares of the
+    mask types temporal / group / causal (three weights in [0.1, 1], normalized to sum 1) and the maximum causal
+    length (1-4 of 8 patches). Needs group tokens (--set model.mts_jepa.group_tokens=true); target_attn,
+    window_relative, vc_weight fixed per study with --set."""
+    w = [trial.suggest_float(f"mask_w_{k}", 0.1, 1.0) for k in ("temporal", "group", "causal")]
+    return {
+        "training": {
+            "lr": trial.suggest_float("lr", 5e-5, 5e-3, log=True),
+            "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
+        },
+        "model": {
+            "mts_jepa": {
+                "embed_dim": trial.suggest_categorical("embed_dim", [64, 128, 256, 384]),
+                "depth": trial.suggest_int("depth", 4, 36, step=2),
+                "predictor_depth": trial.suggest_categorical("predictor_depth", [1, 2]),
+                "mask_mix": [v / sum(w) for v in w],
+                "causal_max": trial.suggest_int("causal_max", 1, 4),
+            }
+        },
+    }
+
+
 SEARCH_SPACES = {"rssm": _rssm_space, "mts_jepa": _mts_jepa_space}
+SEARCH_SPACES_V3 = {"rssm": _rssm_space_v3, "mts_jepa": _mts_jepa_space_v3}
 
 
 def _merge(base: dict, override: dict) -> dict:
@@ -201,8 +254,20 @@ def jepa_embedding_stats(model, loader, device, max_batches: int = 50) -> dict:
 def make_objective(
     model_name: str, base_cfg: dict, loaders: dict, num_features: int,
     device: torch.device, epochs: int, replicate: bool = False,
+    norm=None, objective_kind: str = "score", metric_windows: int = 256, spaces: dict | None = None,
+    early_stop_patience: int = 0,
 ):
+    # early_stop_patience (composite only, 0 = off): stop a trial after this many epochs without a lower J and
+    # return its best J (best epoch in the user attr "best_epoch"); decided 2026-11-12 for MTS-JEPA, whose J has a
+    # clear optimum after a few epochs (Vault training_runs_4hz 9.29)
+    if early_stop_patience and objective_kind != "composite":
+        raise ValueError("early_stop_patience needs the composite objective")
+    spaces = spaces or SEARCH_SPACES
     quiet_logger = MetricLogger({"logging": {"backend": "none"}})
+    # composite objective (tune_metric.py): fixed normal validation windows, the same for every trial
+    W_metric = (tune_metric.sample_windows(loaders["val"].dataset, metric_windows, seed=0)
+                if objective_kind == "composite" else None)
+    columns = get_feature_columns(base_cfg["data"].get("features"))
 
     def objective(trial: optuna.Trial) -> float:
         # A configuration too large for the worker's GPU share is a failed
@@ -220,7 +285,10 @@ def make_objective(
             # configuration, which does not belong in a replicate study.
             trial.set_user_attr("not_a_replicate", True)
             raise optuna.TrialPruned()
-        cfg = _merge(base_cfg, SEARCH_SPACES[model_name](trial))
+        cfg = _merge(base_cfg, spaces[model_name](trial))
+        if spaces is SEARCH_SPACES_V3 and model_name == "mts_jepa" and not cfg["model"]["mts_jepa"].get("group_tokens"):
+            raise ValueError("search space v3 for mts_jepa needs --set model.mts_jepa.group_tokens=true")
+        prepare_model_cfg(cfg, model_name, loaders, norm, False)
         # Seed replicates (--replicate-from) carry their own seed.
         seed = int(trial.user_attrs.get("seed", cfg["seed"]))
         trial.set_user_attr("seed", seed)
@@ -237,17 +305,26 @@ def make_objective(
         score = float("nan")
         global_step = 0
         epoch_max: list[dict] = []
+        # training.amp (opt-in, --set training.amp=true): mixed precision for the training steps
+        scaler = torch.amp.GradScaler("cuda") if cfg["training"].get("amp") else None
+        best_J, best_epoch, no_improve = float("inf"), 0, 0
         for epoch in range(1, epochs + 1):
             max_stats: dict = {}
             train_loss, global_step = train_one_epoch(
                 model, loaders["train"], optimizer, device,
                 float(cfg["training"]["grad_clip_norm"]), quiet_logger,
                 global_step, int(cfg["logging"]["log_every_n_steps"]),
-                max_stats=max_stats,
+                max_stats=max_stats, scaler=scaler,
             )
             epoch_max.append(max_stats)
             trial.set_user_attr("epoch_max", epoch_max)
-            score = val_score(model, model_name, loaders["val"], device)
+            if objective_kind == "composite":
+                score, parts = tune_metric.composite(model, model_name, W_metric, columns, device)
+                trial.set_user_attr("metric_epochs", trial.user_attrs.get("metric_epochs", []) +
+                                    [{k: parts[k] for k in ("J", "a", "b", "c", "auc_mean", "r2_mean")}])
+                trial.set_user_attr("metric_last", parts)
+            else:
+                score = val_score(model, model_name, loaders["val"], device)
             trial.set_user_attr("last_train_loss", train_loss)
             if scheduler is not None:
                 scheduler.step()
@@ -261,12 +338,21 @@ def make_objective(
             trial.report(score, epoch)
             if trial.should_prune():
                 raise optuna.TrialPruned()
+            if early_stop_patience:
+                if score < best_J:
+                    best_J, best_epoch, no_improve = score, epoch, 0
+                else:
+                    no_improve += 1
+                trial.set_user_attr("best_epoch", best_epoch)
+                if no_improve >= early_stop_patience:
+                    trial.set_user_attr("early_stopped_at_epoch", epoch)
+                    break
 
-        if model_name == "mts_jepa":
+        if model_name == "mts_jepa" and not cfg["model"]["mts_jepa"].get("group_tokens"):
             for k, v in jepa_embedding_stats(model, loaders["val"], device).items():
                 trial.set_user_attr(k, v)
 
-        return score
+        return best_J if early_stop_patience else score
 
     return objective
 
@@ -394,6 +480,18 @@ def main() -> None:
                         help="Cap this process's share of GPU memory, so an "
                              "oversized trial fails alone instead of starving "
                              "parallel workers")
+    parser.add_argument("--objective", choices=["score", "composite"], default="score",
+                        help="score: mean anomaly score on val (stage 1/2 studies); composite: tune_metric.py, "
+                             "normal data + generic disturbance catalogue (decided 2026-11-11)")
+    parser.add_argument("--metric-windows", type=int, default=256,
+                        help="normal val windows for the composite objective")
+    parser.add_argument("--early-stop-patience", type=int, default=0,
+                        help="composite only: stop a trial after N epochs without a lower J, return its best J (0 = off)")
+    parser.add_argument("--space", choices=["v2", "v3"], default="v2",
+                        help="v2: search spaces of the studies up to rssm_v2r/mts_jepa_v2r_ext; v3: tuning v3 "
+                             "(decision 2026-11-10: sizes not extended, group masking / mask mixture)")
+    parser.add_argument("--set", nargs="*", default=[], metavar="A.B=C",
+                        help="config overrides (as train.py), applied before the search space")
     parser.add_argument("--worker-id", type=int, default=0,
                         help="Distinct per parallel process on the same study "
                              "(offsets the TPE sampler seed)")
@@ -404,7 +502,7 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    cfg = load_config(args.config, args.experiment, [])
+    cfg = load_config(args.config, args.experiment, args.set)
     # training.epochs is NOT overridden: the LR schedule stays that of a full
     # run, the trial just stops after --epochs epochs (see module docstring).
     if args.epochs > int(cfg["training"]["epochs"]):
@@ -418,7 +516,7 @@ def main() -> None:
     # window_length/stride, resample_freq_hz and features are fixed across
     # all trials -> dataloaders (and the underlying .npy cache) are built
     # once and reused, not rebuilt per trial.
-    loaders, _ = build_dataloaders(cfg["data"])
+    loaders, norm = build_dataloaders(cfg["data"])
     num_features = get_num_features(cfg["data"].get("features"))
 
     storage_dir = Path(args.storage_dir)
@@ -465,7 +563,10 @@ def main() -> None:
             study.stop()
 
     objective = make_objective(args.model, cfg, loaders, num_features, device,
-                               args.epochs, replicate=replicate)
+                               args.epochs, replicate=replicate, norm=norm,
+                               objective_kind=args.objective, metric_windows=args.metric_windows,
+                               spaces=SEARCH_SPACES_V3 if args.space == "v3" else SEARCH_SPACES,
+                               early_stop_patience=args.early_stop_patience)
     if n_trials > 0:
         study.optimize(objective, n_trials=n_trials,
                        callbacks=[_stop_when_queue_empty])
