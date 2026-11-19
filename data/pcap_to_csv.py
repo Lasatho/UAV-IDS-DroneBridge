@@ -86,7 +86,10 @@ DB_FCF = b"\x08\x00\x00\x00"
 # Radiotap length on hwsim0; frame_len is normalized to it
 HWSIM_RADIOTAP_LEN = 22
 
-# Own transmitted frame repeated within this time = capture echo, dropped
+# Own transmitted frame repeated within this time = capture echo, dropped.
+# The echo need not follow its frame directly: with wmediumd it arrives after
+# the simulated airtime (~8 ms at 1 Mbit/s), possibly after the next own
+# frame (A B A' B').
 TX_ECHO_WINDOW_S = 0.05
 
 # Radiotap fields up to dBm_AntSignal (bit 5): (bit, alignment, size)
@@ -235,7 +238,7 @@ def convert_pcap(pcap_path: Path, output_path: Path, offset_ns: int = None,
 
     n_frames = 0
     n_skipped = 0
-    last_tx = (None, -1.0)  # (802.11 bytes, time) of the previous own frame
+    recent_tx: dict[bytes, float] = {}  # 802.11 bytes -> time, own frames within the echo window
 
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -251,11 +254,13 @@ def convert_pcap(pcap_path: Path, output_path: Path, offset_ns: int = None,
                 continue
             if with_signal and fields["signal_dbm"] == "":
                 body = frame_bytes[struct.unpack_from("<H", frame_bytes, 2)[0]:]
-                if body == last_tx[0] and timestamp_s - last_tx[1] < TX_ECHO_WINDOW_S:
+                recent_tx = {b: t for b, t in recent_tx.items()
+                             if timestamp_s - t < TX_ECHO_WINDOW_S}
+                if body in recent_tx:
                     n_skipped += 1
-                    last_tx = (None, -1.0)
+                    del recent_tx[body]
                     continue
-                last_tx = (body, timestamp_s)
+                recent_tx[body] = timestamp_s
 
             fields["timestamp_s"] = f"{timestamp_s:.9f}"
             if offset_ns is not None:

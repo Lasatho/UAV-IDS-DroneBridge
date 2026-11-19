@@ -72,7 +72,9 @@ logger = logging.getLogger(__name__)
 # Bumped whenever load_mission changes its output; part of the cache key
 # (dataset._cache_dir), so stale caches are not reused.
 # 2: rows before the first 3D GPS fix dropped.
-PREPROCESSING_VERSION = 2
+# 3: on-board network CSVs regenerated without capture echoes (pcap_to_csv
+#    echo filter over the whole window); the input data changed, not the code.
+PREPROCESSING_VERSION = 3
 TIME_AXES = ("raster", "sample")
 GPS_FIX_COL = "GPS_RAW_INT__fix_type"
 GPS_FIX_3D = 3
