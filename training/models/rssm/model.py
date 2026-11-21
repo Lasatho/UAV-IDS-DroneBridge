@@ -135,6 +135,8 @@ class RSSM(AnomalyDetectionModel):
         predict_var: bool = False,
         var_weight: float = 1.0,
         score_mode: str = "mse",
+        var_head_isolated: bool = False,
+        var_head_seed: int = 0,
         group_mask_sets: list[list[str]] | None = None,
         group_mask_set_prob: float = 0.0,
         group_mask_start_max: int = 0,
@@ -305,8 +307,18 @@ class RSSM(AnomalyDetectionModel):
         if var_weight < 0:
             raise ValueError("var_weight >= 0 required")
         self.predict_var, self.var_weight, self.score_mode = bool(predict_var), float(var_weight), score_mode
-        self.var_head = (_mlp(deterministic_dim + stochastic_dim + extra, hidden_dim, num_features)
-                         if self.predict_var else None)
+        # var_head_isolated (opt-in, Vault modellumbau_rssm_mtsjepa 2026-11-21, proposal b): the head is initialised in a
+        # forked RNG with its own seed, so the global RNG (batch order, group masks, samples) continues exactly as without
+        # the head, and the head gets its own gradient clipping (clip_param_groups). A run with predict_var then trains
+        # the same dynamics model as the base with the same seed (paired comparison). Off: unchanged behaviour.
+        self.var_head_isolated = bool(var_head_isolated) and self.predict_var
+        if self.var_head_isolated:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(int(var_head_seed))
+                self.var_head = _mlp(deterministic_dim + stochastic_dim + extra, hidden_dim, num_features)
+        else:
+            self.var_head = (_mlp(deterministic_dim + stochastic_dim + extra, hidden_dim, num_features)
+                             if self.predict_var else None)
 
     # ------------------------------------------------------------------
 
@@ -645,6 +657,13 @@ class RSSM(AnomalyDetectionModel):
         res = {"loss": loss, "recon": recon_loss.detach(), "kl_dyn": kl_dyn.detach(), "kl_rep": kl_rep.detach(),
                "kl_dyn_step": out["kl_dyn"].detach().mean(dim=1), "h_norm": h1.detach().norm(dim=-1)}
         return res, (h1.detach(), z1.detach()), batch[:, -1].detach()
+
+    def clip_param_groups(self) -> list[list[nn.Parameter]] | None:
+        """Parameter groups clipped separately (var_head_isolated): [rest, var_head]; None = one group (default)."""
+        if not self.var_head_isolated:
+            return None
+        head = {id(q) for q in self.var_head.parameters()}
+        return [[q for q in self.parameters() if id(q) not in head], list(self.var_head.parameters())]
 
     def nll_terms(self, out: dict, detach_mean: bool = False) -> torch.Tensor:
         """Gaussian NLL per element of the one-step prior prediction, (B, T, F): 0.5 * (log var + err / var)."""

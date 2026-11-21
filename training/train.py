@@ -157,13 +157,13 @@ def train_one_epoch(
         if scaler is None:
             loss.backward()
             if grad_clip > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                grad_norm = clip_gradients(model, grad_clip)
             optimizer.step()
         else:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             if grad_clip > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                grad_norm = clip_gradients(model, grad_clip)
             s0 = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
@@ -205,6 +205,16 @@ def _lane_state(model, lanes, device):
             torch.zeros(lanes, model.num_features, device=device))
 
 
+def clip_gradients(model, grad_clip: float):
+    """Gradient clipping; models with clip_param_groups() (RSSM var_head_isolated) clip each group on its own and
+    report the norm of the first group (the model without the head). Otherwise as before: one norm over all."""
+    groups = model.clip_param_groups() if hasattr(model, "clip_param_groups") else None
+    if not groups:
+        return torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    norms = [torch.nn.utils.clip_grad_norm_(g, grad_clip) for g in groups]
+    return norms[0]
+
+
 def run_stateful_epoch(model, loader, device, optimizer=None, grad_clip: float = 0.0,
                        mlog=None, global_step: int = 0, log_every: int = 1, scheduler=None):
     """One pass over whole missions in chunks (opt-in training.stateful):
@@ -223,7 +233,7 @@ def run_stateful_epoch(model, loader, device, optimizer=None, grad_clip: float =
                 optimizer.zero_grad(set_to_none=True)
                 out["loss"].backward()
                 if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    clip_gradients(model, grad_clip)
                 optimizer.step()
                 if scheduler is not None:  # per-step schedule (training.warmup_unit step)
                     scheduler.step()
