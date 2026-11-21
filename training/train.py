@@ -119,6 +119,7 @@ def train_one_epoch(
     max_stats: dict | None = None,
     scaler: "torch.amp.GradScaler | None" = None,
     spike: dict | None = None,
+    scheduler=None,
 ) -> tuple[float, int]:
     """One training epoch. If `max_stats` is given, it is filled with the
     per-epoch maximum of every training_step output (e.g. `kl_dyn`) and of
@@ -167,6 +168,8 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
             skipped += int(scaler.get_scale() < s0)
+        if scheduler is not None:  # per-step schedule (training.warmup_unit step)
+            scheduler.step()
         steps += 1
         model.on_train_batch_end()
 
@@ -203,7 +206,7 @@ def _lane_state(model, lanes, device):
 
 
 def run_stateful_epoch(model, loader, device, optimizer=None, grad_clip: float = 0.0,
-                       mlog=None, global_step: int = 0, log_every: int = 1):
+                       mlog=None, global_step: int = 0, log_every: int = 1, scheduler=None):
     """One pass over whole missions in chunks (opt-in training.stateful):
     training with optimizer, else validation. Also collects the state drift
     (mean |h| at the chunk end and KL_dyn per step, per bin of the chunk
@@ -222,6 +225,8 @@ def run_stateful_epoch(model, loader, device, optimizer=None, grad_clip: float =
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                if scheduler is not None:  # per-step schedule (training.warmup_unit step)
+                    scheduler.step()
                 model.on_train_batch_end()
                 global_step += 1
                 if mlog is not None and global_step % log_every == 0:
@@ -286,7 +291,7 @@ def prepare_model_cfg(cfg, name, loaders, norm, stateful) -> None:
     if (float(mcfg_.get("group_mask_prob", 0) or 0) > 0 or mcfg_.get("group_tokens")) and not mcfg_.get("groups"):
         # channel groups = MAVLink message / radio direction (prefix of the feature column)
         from data import get_feature_columns
-        cols = get_feature_columns(cfg["data"].get("features"))
+        cols = get_feature_columns(cfg["data"].get("features"), cfg["data"].get("heading_repr", "linear"))
         names = list(dict.fromkeys(c.split("__")[0] for c in cols))
         cfg["model"][name]["groups"] = [[i for i, c in enumerate(cols) if c.split("__")[0] == g] for g in names]
         cfg["model"][name]["group_names"] = names
@@ -295,7 +300,7 @@ def prepare_model_cfg(cfg, name, loaders, norm, stateful) -> None:
     if name == "rssm" and mcfg_.get("abs_inputs") and mcfg_.get("abs_input_idx") is None:
         # model.rssm.abs_inputs: names -> feature indices, stored in the config (checkpoint rebuilds the same model)
         from data import get_feature_columns
-        cols = get_feature_columns(cfg["data"].get("features"))
+        cols = get_feature_columns(cfg["data"].get("features"), cfg["data"].get("heading_repr", "linear"))
         missing = [c for c in mcfg_["abs_inputs"] if c not in cols]
         if missing:
             raise ValueError(f"model.rssm.abs_inputs: unknown channels {missing}")
@@ -316,7 +321,7 @@ def _window_level_options(cfg, name, loaders, norm, stateful) -> None:
         raise NotImplementedError("window_relative / loss_weight / inv_noise_scale are implemented for windows only")
     from data import get_feature_columns
     from models.window_relative import build_spec, WindowRelative
-    cols = get_feature_columns(cfg["data"].get("features"))
+    cols = get_feature_columns(cfg["data"].get("features"), cfg["data"].get("heading_repr", "linear"))
     ds = loaders["train"].dataset
     rng = np.random.default_rng(int(cfg["seed"]))
     W = np.stack([ds[int(i)].numpy() for i in rng.choice(len(ds), min(4000, len(ds)), replace=False)])
@@ -392,7 +397,7 @@ def main() -> None:
                     C, lanes, pool, loaders["train"].n_chunks, loaders["val"].n_chunks, len(loaders["train"]))
     else:
         loaders, norm = build_dataloaders(cfg["data"])
-    num_features = get_num_features(cfg["data"].get("features"))
+    num_features = get_num_features(cfg["data"].get("features"), cfg["data"].get("heading_repr", "linear"))
 
     # --- Model ---
     name = cfg["model"]["name"]
@@ -415,7 +420,10 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Model: %s (%s trainable params)", name, f"{n_params:,}")
 
-    optimizer, scheduler = model.configure_optimizers(tcfg)
+    optimizer, scheduler = model.configure_optimizers(tcfg, steps_per_epoch=len(loaders["train"]))
+    step_sched = scheduler if getattr(scheduler, "per_step", False) else None
+    logger.info("lr schedule: %s, warmup_epochs %s, %d steps per epoch", "per step" if step_sched else "per epoch",
+                tcfg.get("warmup_epochs", 0), len(loaders["train"]))
 
     # --- Checkpointing ---
     run_id = time.strftime("%Y%m%d_%H%M%S") + f"_{name}"
@@ -460,7 +468,7 @@ def main() -> None:
         import tune_metric
         from data import get_feature_columns
         W_metric = tune_metric.sample_windows(loaders["val"].dataset, int(tcfg.get("metric_windows", 256)), seed=0)
-        metric_columns = get_feature_columns(cfg["data"].get("features"))
+        metric_columns = get_feature_columns(cfg["data"].get("features"), cfg["data"].get("heading_repr", "linear"))
     best_val = float("inf")
     epochs_no_improve = 0
     patience = int(tcfg["early_stopping_patience"])
@@ -487,7 +495,7 @@ def main() -> None:
         if stateful:
             train_loss, global_step, _ = run_stateful_epoch(
                 model, loaders["train"], device, optimizer, float(tcfg["grad_clip_norm"]),
-                mlog, global_step, int(cfg["logging"]["log_every_n_steps"]))
+                mlog, global_step, int(cfg["logging"]["log_every_n_steps"]), scheduler=step_sched)
             val_loss, _, drift = run_stateful_epoch(model, loaders["val"], device)
             logger.info("state drift val (mean |h| at chunk end, KL_dyn per step): %s", drift)
         else:
@@ -495,6 +503,7 @@ def main() -> None:
                 model, loaders["train"], optimizer, device,
                 float(tcfg["grad_clip_norm"]), mlog, global_step,
                 int(cfg["logging"]["log_every_n_steps"]), scaler=scaler, max_stats=max_stats, spike=spike,
+                scheduler=step_sched,
             )
             if max_stats:
                 logger.info("train max in epoch %d: %s", epoch, {k: float(f"{v:.5g}") for k, v in max_stats.items()})
@@ -514,7 +523,7 @@ def main() -> None:
                         f"{parts['c']:.4f}" if "c" in parts else "-", time.time() - tm0)
         val_metric = (val_extra["val/norm_loss"] if select_metric == "norm_loss"
                       else val_extra["val_metric/J"] if select_metric == "composite" else val_loss)
-        if scheduler is not None:
+        if scheduler is not None and step_sched is None:
             scheduler.step()
 
         mlog.log(

@@ -16,6 +16,7 @@ Batch layout: float32 tensor (B, T, F) as produced by the data pipeline.
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 
 import torch
@@ -52,7 +53,7 @@ class AnomalyDetectionModel(nn.Module, ABC):
         """
 
     def configure_optimizers(
-        self, cfg: dict
+        self, cfg: dict, steps_per_epoch: int | None = None
     ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler | None]:
         """Default: AdamW + optional cosine schedule, with linear LR warmup.
 
@@ -69,6 +70,31 @@ class AnomalyDetectionModel(nn.Module, ABC):
         )
         warmup_epochs = int(cfg.get("warmup_epochs", 0))
         epochs = int(cfg["epochs"])
+
+        # training.warmup_unit "step" (default): warmup and cosine per optimizer step; the scheduler gets the
+        # attribute per_step = True and the caller steps it after every optimizer step. "epoch": the former
+        # schedule, stepped once per epoch, so with warmup_epochs 1 the whole first epoch ran at start_factor x lr
+        # and epoch 2 started with a 1000x jump (Vault modellumbau_rssm_mtsjepa, 2026-11-20).
+        unit = str(cfg.get("warmup_unit", "step"))
+        if unit not in ("step", "epoch"):
+            raise ValueError(f"training.warmup_unit must be step or epoch, got {unit!r}")
+        if unit == "step" and (warmup_epochs > 0 or cfg.get("scheduler") == "cosine"):
+            if not steps_per_epoch:
+                raise ValueError("training.warmup_unit 'step' needs steps_per_epoch (or set warmup_unit epoch)")
+            w = warmup_epochs * int(steps_per_epoch)
+            total = max(epochs * int(steps_per_epoch), w + 1)
+            cosine = cfg.get("scheduler") == "cosine"
+
+            def factor(step: int) -> float:
+                if step < w:
+                    return 1e-3 + (1.0 - 1e-3) * step / w
+                if not cosine:
+                    return 1.0
+                return 0.5 * (1.0 + math.cos(math.pi * min(step - w, total - w) / (total - w)))
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+            scheduler.per_step = True
+            return optimizer, scheduler
 
         main_scheduler = None
         if cfg.get("scheduler") == "cosine":

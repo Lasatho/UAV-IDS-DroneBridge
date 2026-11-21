@@ -22,7 +22,11 @@ data:
   # Radio stream summarized per raster tick (radio_*) instead of the header fields of the last frame (network_*):
   # on the 4 Hz grid network_* keeps only the last frame of each tick (downlink 28-55 % of the frames never reach the
   # model, missions 30001-30005) and repeats it when no frame arrives. Decided for the v3 retraining (Lasse
-  # 2026-11-08, Vault training_runs_4hz 9.21); 45 columns.
+  # 2026-11-08, Vault training_runs_4hz 9.21); 45 columns, 47 with heading_repr sincos.
+  # Heading channels as sine and cosine: linear, a turn through north jumps by the whole range (Lasse 2026-11-20,
+  # Vault modellumbau_rssm_mtsjepa): set data.heading_repr=sincos per run while older chains still start runs from
+  # this file. Checkpoints from before carry no heading_repr and stay linear.
+  heading_repr: linear
   features:
     network_up: false
     network_down: false

@@ -63,6 +63,13 @@ NETWORK_TYPES = {"network_up", "network_down"} | RADIO_TYPES
 UPLINK_TYPES = {"network_up", "radio_up"}
 UPLINK_DIRECTION = 1
 
+# Circular channels in centidegrees (0..35999). heading_repr "sincos" (opt-in, default "linear") replaces each by its
+# sine and cosine, columns <name>_sin and <name>_cos at the same place. Linear, a turn through north jumps by the
+# whole range (359.5 deg -> 0.2 deg), which the models see as a huge change (10.5 % of the normal windows, Vault
+# modellumbau_rssm_mtsjepa 2026-11-20).
+HEADING_FEATURES = {"GLOBAL_POSITION_INT": "hdg", "GPS_RAW_INT": "cog"}
+HEADING_REPRS = ("linear", "sincos")
+
 # Timestamp columns to drop per message type (not used as features)
 TIMESTAMP_FIELDS: dict[str, list[str]] = {
     "GLOBAL_POSITION_INT": ["time_boot_ms"],
@@ -77,7 +84,8 @@ TIMESTAMP_FIELDS: dict[str, list[str]] = {
 }
 
 
-def get_feature_columns(enabled_messages: dict[str, bool] | None = None) -> list[str]:
+def get_feature_columns(enabled_messages: dict[str, bool] | None = None,
+                        heading_repr: str = "linear") -> list[str]:
     """Return ordered list of feature column names for enabled message types.
 
     Column names are prefixed with message type to avoid collisions
@@ -86,6 +94,7 @@ def get_feature_columns(enabled_messages: dict[str, bool] | None = None) -> list
     Args:
         enabled_messages: Dict mapping message type to bool.
             If None, all message types are enabled.
+        heading_repr: "linear" or "sincos" (HEADING_FEATURES as two columns).
 
     Returns:
         List of prefixed feature column names in stable order.
@@ -93,13 +102,20 @@ def get_feature_columns(enabled_messages: dict[str, bool] | None = None) -> list
     if enabled_messages is None:
         enabled_messages = {k: k not in RADIO_TYPES for k in MESSAGE_FEATURES}
 
+    if heading_repr not in HEADING_REPRS:
+        raise ValueError(f"heading_repr must be one of {HEADING_REPRS}, got {heading_repr!r}")
     columns = []
     for msg_type, features in MESSAGE_FEATURES.items():
         if enabled_messages.get(msg_type, False):
-            columns.extend(f"{msg_type}__{feat}" for feat in features)
+            for feat in features:
+                if heading_repr == "sincos" and HEADING_FEATURES.get(msg_type) == feat:
+                    columns.extend((f"{msg_type}__{feat}_sin", f"{msg_type}__{feat}_cos"))
+                else:
+                    columns.append(f"{msg_type}__{feat}")
     return columns
 
 
-def get_num_features(enabled_messages: dict[str, bool] | None = None) -> int:
+def get_num_features(enabled_messages: dict[str, bool] | None = None,
+                     heading_repr: str = "linear") -> int:
     """Return total number of features for enabled message types."""
-    return len(get_feature_columns(enabled_messages))
+    return len(get_feature_columns(enabled_messages, heading_repr))

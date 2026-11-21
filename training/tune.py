@@ -267,7 +267,7 @@ def make_objective(
     # composite objective (tune_metric.py): fixed normal validation windows, the same for every trial
     W_metric = (tune_metric.sample_windows(loaders["val"].dataset, metric_windows, seed=0)
                 if objective_kind == "composite" else None)
-    columns = get_feature_columns(base_cfg["data"].get("features"))
+    columns = get_feature_columns(base_cfg["data"].get("features"), base_cfg["data"].get("heading_repr", "linear"))
 
     def objective(trial: optuna.Trial) -> float:
         # A configuration too large for the worker's GPU share is a failed
@@ -300,7 +300,8 @@ def make_objective(
             window_length=int(cfg["data"]["window_length"]),
             model_cfg=cfg["model"][model_name],
         ).to(device)
-        optimizer, scheduler = model.configure_optimizers(cfg["training"])
+        optimizer, scheduler = model.configure_optimizers(cfg["training"], steps_per_epoch=len(loaders["train"]))
+        step_sched = scheduler if getattr(scheduler, "per_step", False) else None
 
         score = float("nan")
         global_step = 0
@@ -314,7 +315,7 @@ def make_objective(
                 model, loaders["train"], optimizer, device,
                 float(cfg["training"]["grad_clip_norm"]), quiet_logger,
                 global_step, int(cfg["logging"]["log_every_n_steps"]),
-                max_stats=max_stats, scaler=scaler,
+                max_stats=max_stats, scaler=scaler, scheduler=step_sched,
             )
             epoch_max.append(max_stats)
             trial.set_user_attr("epoch_max", epoch_max)
@@ -326,7 +327,7 @@ def make_objective(
             else:
                 score = val_score(model, model_name, loaders["val"], device)
             trial.set_user_attr("last_train_loss", train_loss)
-            if scheduler is not None:
+            if scheduler is not None and step_sched is None:
                 scheduler.step()
 
             # Diverged run: report as failed (NaN return -> TrialState.FAIL)
@@ -517,7 +518,7 @@ def main() -> None:
     # all trials -> dataloaders (and the underlying .npy cache) are built
     # once and reused, not rebuilt per trial.
     loaders, norm = build_dataloaders(cfg["data"])
-    num_features = get_num_features(cfg["data"].get("features"))
+    num_features = get_num_features(cfg["data"].get("features"), cfg["data"].get("heading_repr", "linear"))
 
     storage_dir = Path(args.storage_dir)
     storage_dir.mkdir(parents=True, exist_ok=True)

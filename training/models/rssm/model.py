@@ -137,6 +137,9 @@ class RSSM(AnomalyDetectionModel):
         score_mode: str = "mse",
         group_mask_sets: list[list[str]] | None = None,
         group_mask_set_prob: float = 0.0,
+        group_mask_start_max: int = 0,
+        consistency_sets: list[list[str]] | None = None,
+        recon_mode_balance: bool = False,
     ):
         super().__init__(num_features, window_length)
         if free_nats_mode not in ("step", "dim"):
@@ -194,6 +197,28 @@ class RSSM(AnomalyDetectionModel):
         else:
             sm = torch.zeros(0, len(self.group_names or []), dtype=torch.bool)
         self.register_buffer("group_set_masks", sm, persistent=False)
+        # group_mask_start_max (opt-in, default 0): a masked sample hides its group(s) from a random step
+        # s ~ U{0..group_mask_start_max} on instead of from the window start; before s the group is observed, at s the
+        # increment base of the hidden channels starts at the last observation x[s-1] (as M2 of lever_metrics). Trains
+        # the transition visible -> hidden (Vault modellumbau_rssm_mtsjepa, joint mask analysis 2026-11-20).
+        self.group_mask_start_max = int(group_mask_start_max)
+        if not 0 <= self.group_mask_start_max < window_length:
+            raise ValueError(f"group_mask_start_max must be in [0, {window_length})")
+        if self.group_mask_start_max > 0 and group_mask_prob <= 0:
+            raise ValueError("group_mask_start_max > 0 needs group_mask_prob > 0")
+        # consistency_sets (opt-in, scoring only): sets of groups scored by set_scores (the set hidden, error of its
+        # prediction from the rest of the vehicle against the observation); no effect on training or anomaly_score
+        self.consistency_sets = [list(c) for c in (consistency_sets or [])]
+        # recon_mode_balance (opt-in, default off): with group masking the recon loss of the hidden channels is far
+        # larger than that of the visible ones and carries 97-99 % of the gradient with the joint mask, so the one-step
+        # prediction with all groups visible learns slowly (Vault modellumbau_rssm_mtsjepa, gate analysis 2026-11-20).
+        # On: recon = sg(L) * (0.5 L_vis / sg(L_vis) + 0.5 L_hid / sg(L_hid)) with L the usual weighted MSE over all
+        # elements and L_vis / L_hid the same over the visible / hidden elements: same value as before (balance with the
+        # KL term unchanged), each mode gets half of the relative gradient. Batches without hidden elements: as before.
+        self.recon_mode_balance = bool(recon_mode_balance)
+        unknown = sorted({g for c in self.consistency_sets for g in c if g not in (self.group_names or [])})
+        if unknown:
+            raise ValueError(f"consistency_sets: unknown groups {unknown}")
         if self.group_mask_prob > 0 and not self.groups:
             raise ValueError("group_mask_prob > 0 needs groups (channel indices per group)")
         if hidden_base not in ("observed", "own", "own_input", "level"):
@@ -285,7 +310,8 @@ class RSSM(AnomalyDetectionModel):
 
     # ------------------------------------------------------------------
 
-    def _encode(self, x: torch.Tensor, gmask: torch.Tensor | None, xa: torch.Tensor | None = None) -> torch.Tensor:
+    def _encode(self, x: torch.Tensor, gmask: torch.Tensor | None, xa: torch.Tensor | None = None,
+                gstart: torch.Tensor | None = None) -> torch.Tensor:
         """Observation embedding; with group masking the hidden groups
         (gmask (B, G) bool) are zeroed and flagged. xa (B, T, n_abs): the abs_inputs
         (values before window_relative), zeroed with the group of their channel."""
@@ -298,11 +324,25 @@ class RSSM(AnomalyDetectionModel):
             gmask = torch.zeros(x.shape[0], self.n_groups, dtype=torch.bool, device=x.device)
         g = gmask.float()
         keep = 1.0 - (g @ self.group_member).clamp(max=1.0)  # (B, F)
-        flags = g.unsqueeze(1).expand(-1, x.shape[1], -1)
-        parts[0] = x * keep.unsqueeze(1)
-        if self.abs_idx is not None:
-            parts[1] = xa * keep[:, self.abs_idx].unsqueeze(1)
+        if gstart is None:
+            flags = g.unsqueeze(1).expand(-1, x.shape[1], -1)
+            parts[0] = x * keep.unsqueeze(1)
+            if self.abs_idx is not None:
+                parts[1] = xa * keep[:, self.abs_idx].unsqueeze(1)
+        else:  # hidden only from gstart (B,) on
+            act = (torch.arange(x.shape[1], device=x.device).unsqueeze(0) >= gstart.unsqueeze(1)).float()  # (B, T)
+            keep_t = 1.0 - (1.0 - keep).unsqueeze(1) * act.unsqueeze(-1)  # (B, T, F)
+            flags = g.unsqueeze(1) * act.unsqueeze(-1)
+            parts[0] = x * keep_t
+            if self.abs_idx is not None:
+                parts[1] = xa * keep_t[:, :, self.abs_idx]
         return self.obs_encoder(torch.cat(parts + [flags], dim=-1))
+
+    def sample_group_start(self, gmask: torch.Tensor | None) -> torch.Tensor | None:
+        """Training: start step of the group mask per sample (group_mask_start_max > 0), else None."""
+        if gmask is None or self.group_mask_start_max <= 0 or not self.training:
+            return None
+        return torch.randint(0, self.group_mask_start_max + 1, (gmask.shape[0],), device=gmask.device)
 
     def sample_group_mask(self, batch_size: int, device) -> torch.Tensor | None:
         """Training: per sample, with group_mask_prob, one random group hidden."""
@@ -350,6 +390,7 @@ class RSSM(AnomalyDetectionModel):
         prev_obs: torch.Tensor | None = None,
         gmask: torch.Tensor | None = None,
         return_latents: bool = False,
+        gstart: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Unroll the RSSM over a window.
 
@@ -392,7 +433,9 @@ class RSSM(AnomalyDetectionModel):
         mqs, lqs = [], []  # return_latents: posterior mean / log std per step (overshooting targets)
         fb = self.free_nats_mode == "dim"
         kls_dyn_fb, kls_rep_fb = [], []  # free_nats_mode "dim": KL with free bits per dimension, summed
-        obs_emb = self._encode(x, gmask, xa)  # (B, T, H)
+        if gstart is not None and (gmask is None or state is not None or prev_obs is not None):
+            raise ValueError("gstart needs gmask and window use (no carried state)")
+        obs_emb = self._encode(x, gmask, xa, gstart)  # (B, T, H)
         # hidden_base "own": the increment base of hidden channels is the model's own previous
         # (posterior) prediction, starting from 0 (= training mean), never the observation
         # "own_input": the same base, but the decoder sees it (and the group flags); "level": hidden channels
@@ -408,6 +451,10 @@ class RSSM(AnomalyDetectionModel):
 
         for t in range(T):
             h = self.gru(z, h)
+            # hidden channels at step t: all of hid without gstart, else only for samples with t >= gstart
+            act = hid if (hid is None or gstart is None) else hid & (gstart <= t).unsqueeze(1)
+            if self.hidden_base == "own_input":
+                fl_t = flags_in if gstart is None else flags_in * (gstart <= t).unsqueeze(1).float()
 
             mu_p, ls_p = self._split_stats(self.prior_net(h))
             mu_q, ls_q = self._split_stats(
@@ -438,8 +485,8 @@ class RSSM(AnomalyDetectionModel):
                 z_prior, z_post = mu_p, mu_q
 
             if self.hidden_base == "own_input":
-                base_in = torch.where(hid, base_h, torch.zeros_like(base_h)) if hid is not None else x.new_zeros(B, x.shape[-1])
-                ex = torch.cat([base_in, flags_in], dim=-1)
+                base_in = torch.where(act, base_h, torch.zeros_like(base_h)) if hid is not None else x.new_zeros(B, x.shape[-1])
+                ex = torch.cat([base_in, fl_t], dim=-1)
                 feat_prior = torch.cat([h, z_prior, ex], dim=-1)
                 dec_prior = self.decoder(feat_prior)
                 dec_post = self.decoder(torch.cat([h, z_post, ex], dim=-1))
@@ -455,13 +502,14 @@ class RSSM(AnomalyDetectionModel):
                 else:
                     prev = x[:, 0] if prev_obs is None else prev_obs
                 if hid is not None and self.hidden_base != "level":
-                    prev = torch.where(hid, base_h, prev)
+                    prev = torch.where(act, base_h, prev)
                 dec_prior, dec_post = prev + dec_prior, prev + dec_post
                 if hid is not None and self.hidden_base == "level":
-                    dec_prior = torch.where(hid, self.level_head(torch.cat([h, z_prior], dim=-1)), dec_prior)
-                    dec_post = torch.where(hid, self.level_head(torch.cat([h, z_post], dim=-1)), dec_post)
+                    dec_prior = torch.where(act, self.level_head(torch.cat([h, z_prior], dim=-1)), dec_prior)
+                    dec_post = torch.where(act, self.level_head(torch.cat([h, z_post], dim=-1)), dec_post)
                 elif hid is not None:
-                    base_h = dec_post
+                    # before gstart the base follows the observation, so it starts at x[s-1] when the group is hidden
+                    base_h = dec_post if gstart is None else torch.where(act, dec_post, x[:, t])
             recon_prior.append(dec_prior)
             recon_post.append(dec_post)
 
@@ -515,12 +563,26 @@ class RSSM(AnomalyDetectionModel):
             return F.mse_loss(pred, x)
         return ((pred - x) ** 2 * self.loss_w).mean()
 
+    def _recon_loss_balanced(self, pred, x, gmask, gstart, total):
+        """recon_mode_balance: per-mode normalized recon loss (see __init__); total = the usual _recon_loss."""
+        se = (pred - x) ** 2 * (self.loss_w if self.loss_w is not None else 1.0)
+        hid = (gmask.float() @ self.group_member).clamp(max=1.0).bool().unsqueeze(1).expand_as(se)  # (B, T, F)
+        if gstart is not None:
+            hid = hid & (torch.arange(se.shape[1], device=se.device).view(1, -1, 1) >= gstart.view(-1, 1, 1))
+        if not bool(hid.any()) or bool(hid.all()):
+            return total
+        lv, lh = se[~hid].mean(), se[hid].mean()
+        return total.detach() * (0.5 * lv / lv.detach().clamp_min(1e-12) + 0.5 * lh / lh.detach().clamp_min(1e-12))
+
     def training_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
         gmask = self.sample_group_mask(batch.shape[0], batch.device)
+        gstart = self.sample_group_start(gmask)
         self.last_gmask = gmask  # diagnostics (train.py training.spike_dump_threshold)
         os_on = self.overshoot_horizon > 0
-        out = self._rollout(batch, use_posterior=True, gmask=gmask, return_latents=os_on)
+        out = self._rollout(batch, use_posterior=True, gmask=gmask, return_latents=os_on, gstart=gstart)
         recon_loss = self._recon_loss(out["recon_post"], out["x"])
+        if self.recon_mode_balance and gmask is not None and bool(gmask.any()):
+            recon_loss = self._recon_loss_balanced(out["recon_post"], out["x"], gmask, gstart, recon_loss)
         # Free nats applied per element, before averaging: each (batch,
         # timestep) KL value is floored at free_nats individually, so
         # elements already above the threshold keep their own gradient
@@ -596,6 +658,27 @@ class RSSM(AnomalyDetectionModel):
         self.eval()
         out = self._rollout(batch, use_posterior=False)
         return self.nll_terms(out) if self.score_mode == "nll" else (out["recon_prior"] - out["x"]) ** 2
+
+    @torch.no_grad()
+    def set_scores(self, batch: torch.Tensor, sets: list[list[str]] | None = None) -> torch.Tensor:
+        """Masked consistency score (B, S): per set (default consistency_sets) the set hidden over the whole window,
+        mean squared error of its posterior prediction (from the rest of the vehicle, hidden_base own_input) against
+        the observation on the set's channels after the burn-in. Opt-in, scoring only (Vault modellumbau_rssm_mtsjepa,
+        joint mask analysis 2026-11-20)."""
+        self.eval()
+        sets = self.consistency_sets if sets is None else [list(c) for c in sets]
+        if not sets or not self.group_names:
+            raise ValueError("set_scores needs sets of group names")
+        cols = []
+        for c in sets:
+            gm = torch.zeros(batch.shape[0], self.n_groups, dtype=torch.bool, device=batch.device)
+            for g in c:
+                gm[:, self.group_names.index(g)] = True
+            ch = (gm[:1].float() @ self.group_member).clamp(max=1.0).bool()[0]
+            out = self._rollout(batch, use_posterior=True, gmask=gm)
+            err = (out["recon_post"] - out["x"]) ** 2
+            cols.append(err[:, self.score_burn_in:][:, :, ch].mean(dim=(1, 2)))
+        return torch.stack(cols, dim=1)
 
     @torch.no_grad()
     def anomaly_score(self, batch: torch.Tensor) -> torch.Tensor:

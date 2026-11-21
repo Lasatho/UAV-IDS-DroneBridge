@@ -125,6 +125,9 @@ class MTSJEPA(AnomalyDetectionModel):
         score_mode: str = "mse",
         group_mask_sets: list[list[str]] | None = None,
         group_mask_set_prob: float = 0.0,
+        group_mask_start_max: int = 0,
+        consistency_sets: list[list[str]] | None = None,
+        group_mask_set_mode: str = "replace",
     ):
         super().__init__(num_features, window_length)
         assert window_length % patch_length == 0, \
@@ -326,6 +329,35 @@ class MTSJEPA(AnomalyDetectionModel):
         else:
             sm = torch.zeros(0, len(self.group_names or []), dtype=torch.bool)
         self.register_buffer("group_set_masks", sm, persistent=False)
+        # group_mask_start_max (opt-in, default 0): the group mask (mask kind "group", also the joint mask) hides its
+        # group(s) from a random patch p ~ U{0..group_mask_start_max} on instead of in all patches; trains the
+        # transition visible -> hidden (Vault modellumbau_rssm_mtsjepa, joint mask analysis 2026-11-20)
+        self.group_mask_start_max = int(group_mask_start_max)
+        if not 0 <= self.group_mask_start_max < window_length // patch_length:
+            raise ValueError("group_mask_start_max must be in [0, num_patches)")
+        if self.group_mask_start_max > 0 and not self.group_tokens:
+            raise ValueError("group_mask_start_max is implemented for group_tokens only")
+        # consistency_sets (opt-in, scoring only): sets of groups scored by set_scores (the set hidden in all patches,
+        # its tokens predicted from the other groups); no effect on training or anomaly_score
+        self.consistency_sets = [list(c) for c in (consistency_sets or [])]
+        # group_mask_set_mode (with group_mask_set_prob): "replace" (default, as before) = a group-kind window hides the
+        # set instead of its single group, so every group is alone the target only half as often with prob 0.5 (gate
+        # analysis 2026-11-20). "add" = the set is a fourth mask kind with the same share as before (group share x
+        # group_mask_set_prob), taken proportionally from the temporal and causal kinds; the group kind keeps its share
+        # and always hides single groups.
+        if group_mask_set_mode not in ("replace", "add"):
+            raise ValueError("group_mask_set_mode must be replace or add")
+        self.group_mask_set_mode = group_mask_set_mode
+        if group_mask_set_mode == "add" and self.group_mask_set_prob > 0:
+            t_, g_, c_ = (float(v) for v in self.mask_mix)
+            s_ = g_ * self.group_mask_set_prob
+            if t_ + c_ <= s_:
+                raise ValueError("group_mask_set_mode add: temporal + causal share too small for the set share")
+            q_ = s_ / (t_ + c_)
+            self.register_buffer("mask_mix4", torch.tensor([t_ * (1 - q_), g_, c_ * (1 - q_), s_]), persistent=False)
+        unknown = sorted({g for c in self.consistency_sets for g in c if g not in (self.group_names or [])})
+        if unknown:
+            raise ValueError(f"consistency_sets: unknown groups {unknown}")
         # fourier_weight (opt-in, default 0, way 3, Vault modellumbau_rssm_mtsjepa 2026-11-17): auxiliary target in a
         # fixed, non-learned second view, after Zhu et al. 2026 (arXiv:2609.04264, random Fourier features of the
         # physical state, shallow head, weight 0.1) and the cross-prediction of JEPA-x (Wen et al. 2026,
@@ -526,7 +558,8 @@ class MTSJEPA(AnomalyDetectionModel):
     def sample_token_mask(self, B: int, device) -> torch.Tensor:
         """Training mask (B, N, G), True = masked, one mask type per window from mask_mix."""
         N, G = self.num_patches, self.n_groups
-        kind = torch.multinomial(self.mask_mix, B, replacement=True)
+        add = self.group_mask_set_prob > 0 and self.group_mask_set_mode == "add"
+        kind = torch.multinomial(self.mask_mix4 if add else self.mask_mix, B, replacement=True)
         m = torch.zeros(B, N, G, dtype=torch.bool, device=device)
         tmask = self._random_mask(B, device)                                # temporal
         m |= (kind == 0).view(B, 1, 1) & tmask.unsqueeze(-1)
@@ -544,11 +577,23 @@ class MTSJEPA(AnomalyDetectionModel):
                 r = r.masked_fill(self.ctx_only.view(1, -1), 2.0)          # context-only groups rank last
             rank = r.argsort(1).argsort(1)
             gm = rank < n
-        if self.group_mask_set_prob > 0:                                   # joint mask: one of group_mask_sets
+        if add:                                                            # joint mask as fourth kind (kind 3)
+            j = torch.randint(self.group_set_masks.shape[0], (B,), device=device)
+            sm = (kind == 3).view(B, 1, 1) & self.group_set_masks[j].unsqueeze(1)
+            if self.group_mask_start_max > 0:
+                p3 = torch.randint(0, self.group_mask_start_max + 1, (B,), device=device)
+                sm = sm & (torch.arange(N, device=device).unsqueeze(0) >= p3.unsqueeze(1)).unsqueeze(-1)
+            m |= sm
+        elif self.group_mask_set_prob > 0:                                 # joint mask: one of group_mask_sets
             use = torch.rand(B, device=device) < self.group_mask_set_prob
             j = torch.randint(self.group_set_masks.shape[0], (B,), device=device)
             gm = torch.where(use.unsqueeze(1), self.group_set_masks[j], gm)
-        m |= (kind == 1).view(B, 1, 1) & gm.unsqueeze(1)
+        if self.group_mask_start_max > 0:  # hidden from a random patch on
+            p0 = torch.randint(0, self.group_mask_start_max + 1, (B,), device=device)
+            pm = torch.arange(N, device=device).unsqueeze(0) >= p0.unsqueeze(1)  # (B, N)
+            m |= (kind == 1).view(B, 1, 1) & gm.unsqueeze(1) & pm.unsqueeze(-1)
+        else:
+            m |= (kind == 1).view(B, 1, 1) & gm.unsqueeze(1)
         k = torch.randint(1, self.causal_max + 1, (B,), device=device)      # causal: last k patches
         cm = torch.arange(N, device=device).unsqueeze(0) >= (N - k).unsqueeze(1)
         m |= (kind == 2).view(B, 1, 1) & cm.unsqueeze(-1)
@@ -685,6 +730,27 @@ class MTSJEPA(AnomalyDetectionModel):
                 d = (self.fourier_head[gi](ctx[:, :, gi][vis]).float() - y[vis]).pow(2).mean(-1)
                 se, ne = se + d.sum(), ne + d.numel()
         return sp / max(np_, 1), se / max(ne, 1)
+
+    @torch.no_grad()
+    def set_scores(self, batch: torch.Tensor, sets: list[list[str]] | None = None) -> torch.Tensor:
+        """Masked consistency score (B, S): per set (default consistency_sets) the set hidden in all patches, mean of
+        the token scores (token_scores: error or NLL as anomaly_score) over the set's target tokens. Context-only groups
+        of a set are hidden but not scored. Opt-in, scoring only (Vault modellumbau_rssm_mtsjepa, 2026-11-20)."""
+        self.eval()
+        sets = self.consistency_sets if sets is None else [list(c) for c in sets]
+        if not sets or not self.group_tokens:
+            raise ValueError("set_scores needs sets of group names and group_tokens")
+        B, N, G = batch.shape[0], self.num_patches, self.n_groups; cols = []
+        for c in sets:
+            mk = torch.zeros(B, N, G, dtype=torch.bool, device=batch.device)
+            for g in c:
+                mk[:, :, list(self.group_names).index(g)] = True
+            sc, v = self.token_scores(batch, mk)
+            tm = mk & v.bool()
+            if self.context_only:
+                tm = tm & ~self.ctx_only.view(1, 1, -1)
+            cols.append((sc * tm).sum((1, 2)) / tm.sum((1, 2)).clamp(min=1))
+        return torch.stack(cols, dim=1)
 
     def token_errors(self, batch: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Per token: squared error of the L2-normalized prediction vs. target, (B, N, G);

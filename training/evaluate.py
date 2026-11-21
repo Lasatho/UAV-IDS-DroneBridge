@@ -226,7 +226,7 @@ def main() -> None:
     name = cfg["model"]["name"]
     model = build_model(
         name,
-        num_features=get_num_features(cfg["data"].get("features")),
+        num_features=get_num_features(cfg["data"].get("features"), cfg["data"].get("heading_repr", "linear")),
         window_length=int(cfg["data"]["window_length"]),
         model_cfg=cfg["model"][name],
     ).to(device)

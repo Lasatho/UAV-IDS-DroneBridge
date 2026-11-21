@@ -44,6 +44,11 @@ Design decisions:
   the flight area and invisible (Vault bewertung_ids_explorativ, decision
   2026-11-09: "diff" for training, "rel_ekf" as ablation). Column names
   stay the same; the cache key contains the representation.
+- Heading representation (opt-in, default "linear"): "sincos" replaces hdg
+  (GLOBAL_POSITION_INT) and cog (GPS_RAW_INT), centidegrees, by their sine
+  and cosine (features.HEADING_FEATURES). Linear, a turn through north is a
+  jump over the whole range. The column names change (<name>_sin,
+  <name>_cos); the cache key contains the representation.
 """
 
 from __future__ import annotations
@@ -56,6 +61,8 @@ import numpy as np
 import pandas as pd
 
 from .features import (
+    HEADING_FEATURES,
+    HEADING_REPRS,
     MESSAGE_FEATURES,
     NETWORK_FILE,
     NETWORK_TYPES,
@@ -179,6 +186,7 @@ def load_mission(
     network_dir: str | Path | None = None,
     time_axis: str = "sample",
     position_repr: str = "abs",
+    heading_repr: str = "linear",
 ) -> pd.DataFrame:
     """Load one mission and align all message types onto a common time axis.
 
@@ -202,10 +210,11 @@ def load_mission(
             of the network_up / network_down streams.
         time_axis: "raster" or "sample", see module doc.
         position_repr: "abs", "diff" or "rel_ekf", see module doc.
+        heading_repr: "linear" or "sincos", see module doc.
 
     Returns:
         DataFrame indexed 0..T-1 with columns
-        [t_ns] + get_feature_columns(enabled_messages).
+        [t_ns] + get_feature_columns(enabled_messages, heading_repr).
         Feature columns are float32.
 
     Raises:
@@ -217,6 +226,8 @@ def load_mission(
         raise ValueError(f"time_axis must be one of {TIME_AXES}, got {time_axis!r}")
     if position_repr not in POSITION_REPRS:
         raise ValueError(f"position_repr must be one of {POSITION_REPRS}, got {position_repr!r}")
+    if heading_repr not in HEADING_REPRS:
+        raise ValueError(f"heading_repr must be one of {HEADING_REPRS}, got {heading_repr!r}")
     if enabled_messages is None:
         enabled_messages = {k: k not in RADIO_TYPES for k in MESSAGE_FEATURES}
 
@@ -291,10 +302,29 @@ def load_mission(
 
     # Before the float32 cast: lat/lon in 1e-7 degrees only resolve ~0.4 m there.
     _apply_position_repr(aligned, position_repr)
+    _apply_heading_repr(aligned, heading_repr, mission_id)
 
+    out_cols = get_feature_columns(enabled_messages, heading_repr)
     aligned = aligned.rename(columns={TIMESTAMP_COL: "t_ns"})
-    aligned[feature_cols] = aligned[feature_cols].astype(np.float32)
-    return aligned[["t_ns"] + feature_cols]
+    aligned[out_cols] = aligned[out_cols].astype(np.float32)
+    return aligned[["t_ns"] + out_cols]
+
+
+def _apply_heading_repr(aligned: pd.DataFrame, heading_repr: str, mission_id: str) -> None:
+    """heading_repr "sincos": add <col>_sin / <col>_cos for the heading channels (the linear column is not selected
+    any more). Values above 360.00 deg (MAVLink UINT16_MAX = unknown) are not in the recorded data and raise."""
+    if heading_repr != "sincos":
+        return
+    for msg, feat in HEADING_FEATURES.items():
+        col = f"{msg}__{feat}"
+        if col not in aligned.columns:
+            continue
+        cdeg = aligned[col].to_numpy(np.float64)
+        if (cdeg > 36000).any() or (cdeg < 0).any():
+            raise ValueError(f"{mission_id}: {col} outside 0..36000 centidegrees")
+        rad = np.deg2rad(cdeg / 100.0)
+        aligned[f"{col}_sin"] = np.sin(rad)
+        aligned[f"{col}_cos"] = np.cos(rad)
 
 
 def _north_east_m(dlat: np.ndarray, dlon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

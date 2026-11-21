@@ -110,7 +110,7 @@ def main() -> None:
 
     name = cfg["model"]["name"]
     window_length = int(cfg["data"]["window_length"])
-    num_features = get_num_features(cfg["data"].get("features"))
+    num_features = get_num_features(cfg["data"].get("features"), cfg["data"].get("heading_repr", "linear"))
 
     model = build_model(
         name, num_features=num_features, window_length=window_length,
