@@ -142,6 +142,9 @@ class RSSM(AnomalyDetectionModel):
         group_mask_start_max: int = 0,
         consistency_sets: list[list[str]] | None = None,
         recon_mode_balance: bool = False,
+        ac: bool = False,
+        ac_action_group: str = "SERVO_OUTPUT_RAW",
+        ac_radio_groups: list[str] | None = None,
     ):
         super().__init__(num_features, window_length)
         if free_nats_mode not in ("step", "dim"):
@@ -319,6 +322,38 @@ class RSSM(AnomalyDetectionModel):
         else:
             self.var_head = (_mlp(deterministic_dim + stochastic_dim + extra, hidden_dim, num_features)
                              if self.predict_var else None)
+        self._init_ac(ac, ac_action_group, ac_radio_groups)
+
+    def _init_ac(self, ac, action_group, radio_groups):
+        """ac (opt-in, RSSM-AC stage 1, Vault Training/entwurf_rssm_ac, approved Lasse 2026-11-26):
+        action input: h_t = GRU(h_{t-1}, [z_{t-1}, a_{t-1}]) with a = the channels of the action group (servo outputs,
+        model input space; a_{-1} := a_0 or the previous observation of the chunk), zeroed while the action group is
+        hidden. The action group stays an observation (encoded and reconstructed).
+        one-way radio: the encoder never sees the radio channels (zeroed; the group flags carry no values), and the
+        decoder's extra input (own_input base) carries no radio values, so h, z and every physical prediction are
+        independent of the radio; the radio channels are predicted as their own previous value plus the change the
+        physical state explains (predict_increment). Group masking from a random step: group_mask_start_max."""
+        self.ac = bool(ac)
+        if not self.ac:
+            return
+        if not self.groups or not self.group_names:
+            raise ValueError("ac needs groups with group_names (group_mask_prob > 0)")
+        if self.overshoot_horizon > 0:
+            raise ValueError("ac stage 1 does not combine with overshooting (prior rollout without actions)")
+        if not self.predict_increment:
+            raise ValueError("ac needs predict_increment (radio = own previous value + explained change)")
+        names = list(self.group_names)
+        if action_group not in names:
+            raise ValueError(f"ac_action_group {action_group!r} not in {names}")
+        radio_groups = ["radio_up", "radio_down"] if radio_groups is None else list(radio_groups)
+        act = self.groups[names.index(action_group)]
+        keep = torch.ones(self.num_features)
+        for g in radio_groups:
+            if g in names:
+                keep[self.groups[names.index(g)]] = 0.0
+        self.register_buffer("ac_act_idx", torch.tensor(act, dtype=torch.long), persistent=False)
+        self.register_buffer("ac_keep", keep, persistent=False)
+        self.gru = nn.GRUCell(self.stochastic_dim + len(act), self.deterministic_dim)
 
     # ------------------------------------------------------------------
 
@@ -447,7 +482,10 @@ class RSSM(AnomalyDetectionModel):
         kls_dyn_fb, kls_rep_fb = [], []  # free_nats_mode "dim": KL with free bits per dimension, summed
         if gstart is not None and (gmask is None or state is not None or prev_obs is not None):
             raise ValueError("gstart needs gmask and window use (no carried state)")
-        obs_emb = self._encode(x, gmask, xa, gstart)  # (B, T, H)
+        ac_on = getattr(self, "ac", False)
+        obs_emb = self._encode(x * self.ac_keep if ac_on else x, gmask, xa, gstart)  # (B, T, H)
+        ac_hid = (gmask.float() @ self.group_member).clamp(max=1.0).bool()[:, self.ac_act_idx] \
+            if ac_on and gmask is not None else None
         # hidden_base "own": the increment base of hidden channels is the model's own previous
         # (posterior) prediction, starting from 0 (= training mean), never the observation
         # "own_input": the same base, but the decoder sees it (and the group flags); "level": hidden channels
@@ -462,7 +500,16 @@ class RSSM(AnomalyDetectionModel):
             flags_in = gmask.float() if gmask is not None else x.new_zeros(B, self.n_groups)
 
         for t in range(T):
-            h = self.gru(z, h)
+            if ac_on:
+                s_ = max(t - 1, 0)
+                a = x[:, t - 1] if t > 0 else (x[:, 0] if prev_obs is None else prev_obs)
+                a = a[:, self.ac_act_idx]
+                if ac_hid is not None:
+                    a_h = ac_hid if gstart is None else ac_hid & (gstart <= s_).unsqueeze(1)
+                    a = torch.where(a_h, torch.zeros_like(a), a)
+                h = self.gru(torch.cat([z, a], dim=-1), h)
+            else:
+                h = self.gru(z, h)
             # hidden channels at step t: all of hid without gstart, else only for samples with t >= gstart
             act = hid if (hid is None or gstart is None) else hid & (gstart <= t).unsqueeze(1)
             if self.hidden_base == "own_input":
@@ -498,6 +545,8 @@ class RSSM(AnomalyDetectionModel):
 
             if self.hidden_base == "own_input":
                 base_in = torch.where(act, base_h, torch.zeros_like(base_h)) if hid is not None else x.new_zeros(B, x.shape[-1])
+                if ac_on:
+                    base_in = base_in * self.ac_keep
                 ex = torch.cat([base_in, fl_t], dim=-1)
                 feat_prior = torch.cat([h, z_prior, ex], dim=-1)
                 dec_prior = self.decoder(feat_prior)
