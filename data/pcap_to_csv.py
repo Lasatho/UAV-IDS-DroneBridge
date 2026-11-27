@@ -223,10 +223,80 @@ def extract_db_fields(frame_bytes: bytes, orig_len: int, with_signal: bool = Fal
     return fields
 
 
+# Simulation-control parameters (SITL SIM_*) do not exist on a real vehicle. Setting them (attack scripts:
+# SIM_GPS1_GLTCH_*, SIM_GPS1_JAM; orchestrator) makes the autopilot broadcast PARAM_VALUE on every MAVLink channel,
+# including the radio link (Vault eval_gnss_spoofing, finding 46). Opt-in --drop-sim-params removes the bytes of
+# PARAM_VALUE (22) / PARAM_SET (23) packets whose param_id starts with SIM_ from the MAVLink stream of port 1.
+SIM_PARAM_PREFIX = b"SIM_"
+_PARAM_ID_OFFSET = {22: 8, 23: 6}  # PARAM_VALUE: value f32, count u16, index u16, id; PARAM_SET: value f32, sys, comp, id
+MAVLINK_PORT = 1
+
+
+def sim_param_ranges(stream: bytes) -> list[tuple[int, int]]:
+    """Byte ranges [a, b) of MAVLink v1/v2 PARAM_VALUE/PARAM_SET packets with a SIM_ param_id in a stream."""
+    out, i, n = [], 0, len(stream)
+    while i < n:
+        b = stream[i]
+        if b == 0xFD and i + 10 <= n:
+            ln, inc = stream[i + 1], stream[i + 2]; tot = 12 + ln + (13 if inc & 1 else 0)
+            if i + tot > n:
+                break
+            mid = stream[i + 7] | stream[i + 8] << 8 | stream[i + 9] << 16; pay = stream[i + 10:i + 10 + ln]
+        elif b == 0xFE and i + 6 <= n:
+            ln = stream[i + 1]; tot = 8 + ln
+            if i + tot > n:
+                break
+            mid = stream[i + 5]; pay = stream[i + 6:i + 6 + ln]
+        else:
+            i += 1
+            continue
+        off = _PARAM_ID_OFFSET.get(mid)
+        if off is not None and pay[off:off + len(SIM_PARAM_PREFIX)] == SIM_PARAM_PREFIX:
+            out.append((i, i + tot))
+        i += tot
+    return out
+
+
+def drop_sim_params(rows: list[dict], payloads: list[bytes]) -> tuple[list[dict], int, int]:
+    """Subtract the bytes of SIM_ parameter packets from payload_len/frame_len of the port-1 frames they occupy
+    (stream per direction, frames in capture order); frames left without payload are dropped and the later sequence
+    numbers of that direction/port shifted. Returns rows, removed bytes, dropped frames."""
+    removed = 0
+    emptied = set()
+    for direction in {r["direction"] for r in rows}:
+        idx = [k for k, r in enumerate(rows) if r["direction"] == direction and r["port"] == MAVLINK_PORT]
+        starts, pos = [], 0
+        for k in idx:
+            starts.append(pos); pos += len(payloads[k])
+        stream = b"".join(payloads[k] for k in idx)
+        for a, b in sim_param_ranges(stream):
+            for k, f0 in zip(idx, starts):
+                f1 = f0 + len(payloads[k]); ov = min(b, f1) - max(a, f0)
+                if ov > 0:
+                    rows[k]["payload_len"] -= ov; rows[k]["frame_len"] -= ov; removed += ov
+                    if rows[k]["payload_len"] == 0:
+                        emptied.add(k)
+    # A frame that carried only such packets would not have been sent: drop it and shift the sequence numbers of the
+    # later frames of the same direction and port, so the removal leaves no gap in seq_num (seq_lost unchanged).
+    dropped = {}
+    out = []
+    for k, r in enumerate(rows):
+        key = (r["direction"], r["port"])
+        if k in emptied:
+            dropped[key] = dropped.get(key, 0) + 1
+            continue
+        if dropped.get(key):
+            r["seq_num"] = (r["seq_num"] - dropped[key]) % 256
+        out.append(r)
+    return out, removed, len(emptied)
+
+
 def convert_pcap(pcap_path: Path, output_path: Path, offset_ns: int = None,
-                 with_signal: bool = False, freq_mhz: int = None):
+                 with_signal: bool = False, freq_mhz: int = None, drop_sim: bool = False):
     """Convert a single PCAP to CSV; with offset_ns (epoch - monotonic of
-    the capture host) also write host_timestamp_ns."""
+    the capture host) also write host_timestamp_ns. drop_sim: remove the bytes of
+    SIM_ parameter packets (drop_sim_params); removed bytes and frames left without
+    payload (dropped) are stored in convert_pcap.last_removed."""
     fieldnames = [
         "timestamp_s", "frame_len", "direction",
         "comm_id", "port", "payload_len", "seq_num"
@@ -239,6 +309,8 @@ def convert_pcap(pcap_path: Path, output_path: Path, offset_ns: int = None,
     n_frames = 0
     n_skipped = 0
     recent_tx: dict[bytes, float] = {}  # 802.11 bytes -> time, own frames within the echo window
+    rows: list[dict] = []
+    payloads: list[bytes] = []
 
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -265,8 +337,17 @@ def convert_pcap(pcap_path: Path, output_path: Path, offset_ns: int = None,
             fields["timestamp_s"] = f"{timestamp_s:.9f}"
             if offset_ns is not None:
                 fields["host_timestamp_ns"] = round(timestamp_s * 1e9) - offset_ns
-            writer.writerow(fields)
-            n_frames += 1
+            rows.append(fields)
+            if drop_sim:
+                r = struct.unpack_from("<H", frame_bytes, 2)[0] + DB_HEADER_LEN
+                payloads.append(frame_bytes[r:r + fields["payload_len"]])
+
+        convert_pcap.last_removed = (0, 0)
+        if drop_sim:
+            rows, removed, empty = drop_sim_params(rows, payloads)
+            convert_pcap.last_removed = (removed, empty)
+        writer.writerows(rows)
+        n_frames = len(rows)
 
     return n_frames, n_skipped
 
@@ -296,6 +377,9 @@ def main():
                              "(radio_freq_mhz, default 2437)")
     parser.add_argument("--with-signal", action="store_true",
                         help="add the signal_dbm column (implied by --onboard)")
+    parser.add_argument("--drop-sim-params", action="store_true",
+                        help="remove PARAM_VALUE/PARAM_SET packets of SITL SIM_* parameters from the "
+                             "byte counts (simulation control, not present on a real vehicle)")
     args = parser.parse_args()
     if args.onboard and (args.freq_mhz or args.freq_from_labels):
         parser.error("--freq-mhz/--freq-from-labels only for hwsim0 captures: own frames "
@@ -309,7 +393,7 @@ def main():
         output = args.output or args.pcap.with_suffix(".csv")
         print(f"Converting {args.pcap.name}...")
         n_frames, n_skipped = convert_pcap(args.pcap, output, offset_ns, args.with_signal,
-                                           args.freq_mhz)
+                                           args.freq_mhz, args.drop_sim_params)
         print(f"  {n_frames} frames extracted, {n_skipped} skipped")
         print(f"  Output: {output}")
 
@@ -333,6 +417,7 @@ def main():
         print(f"Batch converting {len(pcaps)} PCAPs...")
         total_frames = 0
         total_skipped = 0
+        total_removed = total_empty = 0
 
         for i, pcap_path in enumerate(pcaps):
             mission_id = pcap_path.stem
@@ -343,7 +428,10 @@ def main():
                 label = args.dataset / "phase_labels" / f"{mission_id}.json"
                 freq = int(json.loads(label.read_text()).get("radio_freq_mhz") or 2437)
             n_frames, n_skipped = convert_pcap(pcap_path, output_path, offset_ns,
-                                               args.onboard or args.with_signal, freq)
+                                               args.onboard or args.with_signal, freq,
+                                               args.drop_sim_params)
+            total_removed += convert_pcap.last_removed[0]
+            total_empty += convert_pcap.last_removed[1]
             total_frames += n_frames
             total_skipped += n_skipped
 
@@ -351,6 +439,8 @@ def main():
                 print(f"  [{i+1}/{len(pcaps)}] {total_frames} frames total")
 
         print(f"\nDone: {total_frames} frames, {total_skipped} skipped")
+        if args.drop_sim_params:
+            print(f"SIM_ parameter packets removed: {total_removed} bytes; frames dropped (only such packets): {total_empty}")
         print(f"Output: {network_dir}/")
 
     else:
