@@ -26,7 +26,7 @@ data:
   # Heading channels as sine and cosine: linear, a turn through north jumps by the whole range (Lasse 2026-11-20,
   # Vault modellumbau_rssm_mtsjepa): set data.heading_repr=sincos per run while older chains still start runs from
   # this file. Checkpoints from before carry no heading_repr and stay linear.
-  heading_repr: linear
+  heading_repr: sincos
   features:
     network_up: false
     network_down: false
