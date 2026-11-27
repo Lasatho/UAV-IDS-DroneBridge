@@ -255,11 +255,21 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
             mission_ids = mission_ids[: int(max_missions)]
         logger.info("Using %d missions", len(mission_ids))
 
-        splits = split_missions(
-            mission_ids,
-            ratios=tuple(cfg["split_ratios"]),
-            seed=int(cfg["split_seed"]),
-        )
+        if cfg.get("split_file"):
+            # Fixed assignment from a splits.json (v4: the split of v3, same mission IDs), so the
+            # split does not depend on how many missions exist yet. Missions not in the file are left out.
+            fixed = json.loads(Path(cfg["split_file"]).read_text())
+            have = set(mission_ids)
+            splits = {k: [m for m in fixed[k] if m in have] for k in ("train", "val", "test")}
+            extra = sorted(have - {m for ids in fixed.values() for m in ids})
+            logger.info("Split from %s: %s, %d missions not in the file left out%s", cfg["split_file"],
+                        {k: len(v) for k, v in splits.items()}, len(extra), f" (e.g. {extra[:3]})" if extra else "")
+        else:
+            splits = split_missions(
+                mission_ids,
+                ratios=tuple(cfg["split_ratios"]),
+                seed=int(cfg["split_seed"]),
+            )
 
     # Load (with cache) per split; skip missions that fail alignment.
     arrays: dict[str, list[np.ndarray]] = {}
@@ -281,14 +291,23 @@ def build_datasets(cfg: dict) -> tuple[dict[str, TelemetryWindowDataset], Normal
     if not arrays["train"]:
         raise RuntimeError("Training split is empty after loading")
 
-    # Normalizer: fit on train only, persist next to the cache.
+    # Normalizer: fit on train only, persist next to the cache. Files with a fingerprint of the
+    # training missions are refitted when the training set changed (growing v4 cache); files
+    # without one (before 2026-11-26) are kept as before.
+    train_sha = hashlib.sha1("|".join(sorted(ids_used["train"])).encode()).hexdigest()[:12]
     if norm_path.exists():
         normalizer = Normalizer.load(norm_path)
-        if normalizer.columns != feature_cols:
+        stale = normalizer.train_ids_sha1 is not None and normalizer.train_ids_sha1 != train_sha
+        if normalizer.columns != feature_cols or stale:
+            if stale:
+                logger.info("Training set changed (%s -> %s): refitting the normalizer",
+                            normalizer.train_ids_sha1, train_sha)
             normalizer = Normalizer.fit(arrays["train"], feature_cols)
+            normalizer.train_ids_sha1 = train_sha
             normalizer.save(norm_path)
     else:
         normalizer = Normalizer.fit(arrays["train"], feature_cols)
+        normalizer.train_ids_sha1 = train_sha
         normalizer.save(norm_path)
 
     (cache_dir / "splits.json").write_text(json.dumps(ids_used, indent=2))

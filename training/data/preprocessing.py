@@ -81,7 +81,7 @@ logger = logging.getLogger(__name__)
 # 2: rows before the first 3D GPS fix dropped.
 # 3: on-board network CSVs regenerated without capture echoes (pcap_to_csv
 #    echo filter over the whole window); the input data changed, not the code.
-PREPROCESSING_VERSION = 3
+PREPROCESSING_VERSION = 4
 TIME_AXES = ("raster", "sample")
 GPS_FIX_COL = "GPS_RAW_INT__fix_type"
 GPS_FIX_3D = 3
@@ -465,7 +465,11 @@ class Normalizer:
     applied unchanged to val/test (and later to attack data).
     """
 
-    def __init__(self, mean: np.ndarray, std: np.ndarray, columns: list[str]):
+    def __init__(self, mean: np.ndarray, std: np.ndarray, columns: list[str],
+                 train_ids_sha1: str | None = None):
+        # Fingerprint of the training missions the statistics come from (None in files from
+        # before 2026-11-26): a cache that grows (v4 while it is being flown) refits when it changes.
+        self.train_ids_sha1 = train_ids_sha1
         self.mean = mean.astype(np.float32)
         std = std.astype(np.float32)
         # Constant features (std == 0) are mapped to 0 instead of NaN.
@@ -494,6 +498,8 @@ class Normalizer:
             "mean": self.mean.tolist(),
             "std": self.std.tolist(),
         }
+        if self.train_ids_sha1:
+            payload["train_ids_sha1"] = self.train_ids_sha1
         Path(path).write_text(json.dumps(payload, indent=2))
 
     @classmethod
@@ -503,6 +509,7 @@ class Normalizer:
             mean=np.array(payload["mean"], dtype=np.float32),
             std=np.array(payload["std"], dtype=np.float32),
             columns=payload["columns"],
+            train_ids_sha1=payload.get("train_ids_sha1"),
         )
 
     # -- fitting ---------------------------------------------------------

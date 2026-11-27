@@ -1,0 +1,42 @@
+# === Dataset v4 (Lasse 2026-11-26) ===
+# On-board view of v4: all missions re-flown with the sensor noise model and Lua GNSS spoofing
+# (Vault attack_dataset_design 40.2, sensorrauschen). Same mission IDs as v3; the split is the one of v3
+# (splits_v3.json, md5 d5eb734f) so train/val/test do not depend on how far v4 has been flown. The manifest
+# is written by deploy_20261125_ekf3all/noise_run/v4_data_sync.py (completed, no noise ALERT, network CSVs present).
+#   python train.py --experiment configs/onboard_v4.yaml
+#   attack data: data.mission_manifest=../dataset/_ekf3all_20261125/missions_manifest_v4_attack.csv
+
+# === On-board view overlay ===
+# Telemetry recorded directly at the flight controller (SITL SERIAL2) and the
+# radio frames of the vehicle's own interface (wlan0), as an IDS on the
+# vehicle sees them. Recorded since normal dataset v3 and the
+# rf_jamming/frame_injection re-flight of 2026-11-03; v2 has the GCS view
+# only (telemetry/, network/). Convert the captures first with
+#   python3 data/pcap_to_csv.py --dataset ../dataset --onboard --clock-offset ... --manifest ...
+# The source is part of the cache key, so GCS and on-board caches never mix.
+#
+# Usage:
+#   cd training
+#   python train.py --experiment configs/onboard.yaml
+#   # other manifest, e.g. the attack data:
+#   python train.py --experiment configs/onboard.yaml data.mission_manifest=../dataset/<manifest>.csv
+
+data:
+  dataset_dir: "../dataset/_ekf3all_20261125"
+  mission_manifest: "${data.dataset_dir}/missions_manifest_v4_normal.csv"
+  split_file: "${data.dataset_dir}/splits_v3.json"
+  telemetry_dir: "${data.dataset_dir}/telemetry_onboard"
+  network_dir: "${data.dataset_dir}/network_onboard"
+  # Radio stream summarized per raster tick (radio_*) instead of the header fields of the last frame (network_*):
+  # on the 4 Hz grid network_* keeps only the last frame of each tick (downlink 28-55 % of the frames never reach the
+  # model, missions 30001-30005) and repeats it when no frame arrives. Decided for the v3 retraining (Lasse
+  # 2026-11-08, Vault training_runs_4hz 9.21); 45 columns, 47 with heading_repr sincos.
+  # Heading channels as sine and cosine: linear, a turn through north jumps by the whole range (Lasse 2026-11-20,
+  # Vault modellumbau_rssm_mtsjepa): set data.heading_repr=sincos per run while older chains still start runs from
+  # this file. Checkpoints from before carry no heading_repr and stay linear.
+  heading_repr: sincos
+  features:
+    network_up: false
+    network_down: false
+    radio_up: true
+    radio_down: true
