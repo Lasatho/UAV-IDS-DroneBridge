@@ -128,6 +128,13 @@ class MTSJEPA(AnomalyDetectionModel):
         group_mask_start_max: int = 0,
         consistency_sets: list[list[str]] | None = None,
         group_mask_set_mode: str = "replace",
+        ac: bool = False,
+        ac_action_group: str = "SERVO_OUTPUT_RAW",
+        ac_radio_groups: list[str] | None = None,
+        ac_horizon: int = 2,
+        ac_group_mask_prob: float = 0.3,
+        ac_score: str = "token",
+        ac_recon_norm: dict | None = None,
     ):
         super().__init__(num_features, window_length)
         assert window_length % patch_length == 0, \
@@ -385,6 +392,177 @@ class MTSJEPA(AnomalyDetectionModel):
                 self.register_buffer(f"fw_{gi}", w)
             self.fourier_head = nn.ModuleList(nn.Sequential(nn.Linear(embed_dim, 64), nn.GELU(), nn.Linear(64, 2 * d))
                                               for _ in self.groups)
+        self._init_ac(ac, ac_action_group, ac_radio_groups, ac_horizon, ac_group_mask_prob, embed_dim)
+        self.ac_score = str(ac_score)
+        if self.ac_score not in ("token", "recon", "recon_norm"):
+            raise ValueError("ac_score must be token, recon or recon_norm")
+        if self.ac_score != "token" and not (self.ac and self.recon_weight > 0):
+            raise ValueError("ac_score recon / recon_norm needs ac and a reconstruction head (recon_weight > 0)")
+        if self.ac_score == "recon_norm":
+            if not ac_recon_norm or len(ac_recon_norm.get("med", [])) != num_features or len(ac_recon_norm.get("scale", [])) != num_features:
+                raise ValueError("ac_score recon_norm needs ac_recon_norm with med and scale per feature")
+            if min(ac_recon_norm["scale"]) <= 0:
+                raise ValueError("ac_recon_norm scale must be > 0")
+            self.register_buffer("ac_rn_med", torch.tensor(ac_recon_norm["med"], dtype=torch.float32), persistent=False)
+            self.register_buffer("ac_rn_scale", torch.tensor(ac_recon_norm["scale"], dtype=torch.float32), persistent=False)
+
+    # ------------------------------------------------------------------
+    # MTS-JEPA-AC (stage 1, Vault Training/entwurf_mts_jepa_ac, approved Lasse 2026-11-26)
+    # ------------------------------------------------------------------
+
+    def _init_ac(self, ac, action_group, radio_groups, horizon, group_mask_prob, embed_dim):
+        """ac (opt-in): action-conditioned, causal variant. Token order (patch n, group g) -> n * G + g.
+        Context and target encoder: block-causal in time (a token sees patches <= its own), one-way radio (physical
+        tokens never attend radio tokens; radio tokens may attend physical ones); the target encoder additionally only
+        within its group (target_attn group). Predictor: one pass over [context tokens (N*G) | raw action tokens (N) |
+        queries (H*N*G)]; the query of horizon k, patch m, group g predicts the target token (m, g) from the context of
+        patches <= m - k and the raw action tokens of patches m - k + 1 .. m (the action group itself: .. m - 1, i.e. a
+        forward prediction of the command), and sees the other queries of the same k and m (same radio rule). Direct
+        multi-step prediction from the cut-off m - k (all horizons in parallel, no recursive feedback), so a lasting
+        offset is measured against a prediction anchored before it. Training: all groups are targets; with probability
+        ac_group_mask_prob a window hides one random group in all patches of the context (sensor redundancy, as the
+        group mask of the masked JEPA; also used by the evaluation tools). Loss = normalized token error over the valid
+        tokens (m >= k) of all horizons; recon_weight puts the reconstruction head (decoder anchor) on the horizon-1
+        predictions; vc/inv terms as before with the causal target attention. The masked-JEPA interface
+        (token_errors, predict_tokens, target_tokens, recon_values, set_scores) works with the horizon-1 predictions:
+        mask = tokens hidden from the context."""
+        self.ac = bool(ac)
+        if not self.ac:
+            return
+        if not self.group_tokens or not self.group_names:
+            raise ValueError("ac needs group_tokens with group_names")
+        if self.target_attn != "group":
+            raise ValueError("ac is implemented for target_attn group")
+        if self.context_only or self.group_mask_set_prob > 0 or self.fourier_weight > 0 or self.var_head is not None \
+                or self.self_head_on:
+            raise ValueError("ac stage 1 does not combine with context_only_groups, group_mask_sets, fourier, step-1 heads")
+        names = list(self.group_names); N, G = self.num_patches, self.n_groups
+        if action_group not in names:
+            raise ValueError(f"ac_action_group {action_group!r} not in {names}")
+        radio_groups = ["radio_up", "radio_down"] if radio_groups is None else list(radio_groups)
+        self.ac_a = names.index(action_group)
+        self.ac_h = int(horizon)
+        if not 1 <= self.ac_h < N:
+            raise ValueError("ac_horizon must be in 1..num_patches-1")
+        self.ac_gmp = float(group_mask_prob)
+        if not 0.0 <= self.ac_gmp <= 1.0:
+            raise ValueError("ac_group_mask_prob must be in [0, 1]")
+        radio = torch.tensor([g in radio_groups for g in names])
+        L = N * G; n_of = torch.arange(L) // G; g_of = torch.arange(L) % G
+        phys_q = ~radio[g_of]; rad_k = radio[g_of]
+        ctx = (n_of.view(1, -1) > n_of.view(-1, 1)) | (phys_q.view(-1, 1) & rad_k.view(1, -1))   # True = blocked
+        self.register_buffer("ac_ctx_mask", ctx, persistent=False)
+        self.register_buffer("ac_tgt_mask", ctx | (g_of.view(-1, 1) != g_of.view(1, -1)), persistent=False)
+        H = self.ac_h; Q = H * N * G; T_ = L + N + Q
+        m = torch.ones(T_, T_, dtype=torch.bool)
+        m[:L, :L] = ctx                                            # context rows: as in the encoder
+        m[L:L + N, L:L + N] = ~torch.eye(N, dtype=torch.bool)      # action rows: only themselves
+        qk = torch.arange(Q) // (N * G); qn = (torch.arange(Q) // G) % N; qg = torch.arange(Q) % G
+        qphys = ~radio[qg]
+        cut = qn - (qk + 1)                                        # last context patch of the query
+        m[L + N:, :L] = (n_of.view(1, -1) > cut.view(-1, 1)) | (qphys.view(-1, 1) & rad_k.view(1, -1))
+        an = torch.arange(N)
+        last_act = torch.where(qg == self.ac_a, qn - 1, qn)        # the command itself is not given to its own query
+        m[L + N:, L:L + N] = ~((an.view(1, -1) > cut.view(-1, 1)) & (an.view(1, -1) <= last_act.view(-1, 1)))
+        same = (qk.view(-1, 1) == qk.view(1, -1)) & (qn.view(-1, 1) == qn.view(1, -1))
+        m[L + N:, L + N:] = ~same | (qphys.view(-1, 1) & radio[qg].view(1, -1))
+        assert not m.all(1).any(), "a token without any key"
+        self.register_buffer("ac_pred_mask", m, persistent=False)
+        valid = torch.arange(N).view(1, N, 1) >= torch.arange(1, H + 1).view(H, 1, 1)  # (H, N, 1): m >= k
+        self.register_buffer("ac_valid", valid.expand(H, N, G).clone(), persistent=False)
+        self.ac_query = nn.Parameter(torch.zeros(H, embed_dim)); nn.init.normal_(self.ac_query, std=0.02)
+        self.ac_act_pos = nn.Parameter(torch.zeros(1, 1, embed_dim)); nn.init.normal_(self.ac_act_pos, std=0.02)
+
+    def _tgt_attn(self):
+        """Attention mask of the target encoder and of its online counterpart (vc/inv terms)."""
+        if getattr(self, "ac", False):
+            return self.ac_tgt_mask
+        return self.target_attn_mask if self.target_attn == "group" else None
+
+    def _ac_forward(self, batch: torch.Tensor, hide: torch.Tensor | None = None):
+        """(predictions (B, H, N, G, D), context (B, N, G, D)); hide (B, N, G) True = token hidden from the context
+        (for the action group also its raw action token)."""
+        tok = self._group_tokens(batch, target=False)                              # (B, N, G, D)
+        B, N, G, D = tok.shape; H = self.ac_h
+        mtok = (self.mask_token.view(1, 1, 1, -1) + self.gpos_embed + self.group_pos).expand(B, -1, -1, -1)
+        tin = tok if hide is None else torch.where(hide.unsqueeze(-1), mtok, tok)
+        ctx = self.context_encoder(tin.reshape(B, N * G, D), mask=self.ac_ctx_mask)
+        act = tin[:, :, self.ac_a] + self.ac_act_pos                               # (B, N, D)
+        q = (self.mask_token.view(1, 1, 1, 1, -1) + self.gpos_embed.unsqueeze(1) + self.group_pos.unsqueeze(1)
+             + self.ac_query.view(1, H, 1, 1, -1)).expand(B, -1, N, G, -1)
+        seq = torch.cat([ctx, act, q.reshape(B, H * N * G, D)], dim=1)
+        out = self.predictor(seq, mask=self.ac_pred_mask)
+        return out[:, N * G + N:].reshape(B, H, N, G, D), ctx.view(B, N, G, D)
+
+    def _ac_errors(self, batch: torch.Tensor, hide: torch.Tensor | None = None):
+        """(err (B, H, N, G) normalized token error per horizon, preds, ctx)."""
+        preds, ctx = self._ac_forward(batch, hide)
+        t = F.normalize(self.target_tokens(batch), dim=-1).unsqueeze(1)
+        err = ((F.normalize(preds, dim=-1) - t) ** 2).mean(dim=-1)
+        return err, preds, ctx
+
+    def _ac_training_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
+        B, N, G = batch.shape[0], self.num_patches, self.n_groups
+        hide = None
+        if self.training and self.ac_gmp > 0:
+            on = torch.rand(B, device=batch.device) < self.ac_gmp
+            g = torch.randint(0, G, (B,), device=batch.device)
+            hide = (torch.arange(G, device=batch.device).view(1, 1, G) == g.view(B, 1, 1)) & on.view(B, 1, 1)
+            hide = hide.expand(B, N, G)
+        err, preds, _ = self._ac_errors(batch, hide)
+        v = self.ac_valid.unsqueeze(0).expand(B, -1, -1, -1)
+        loss = err[v].mean()
+        out = {"loss": loss, "jepa": loss.detach()}
+        for k in range(self.ac_h):
+            out[f"jepa_h{k + 1}"] = err[:, k][v[:, k]].mean().detach()
+        if self.recon_weight > 0 and self.training:
+            se = (self.recon_from_pred(preds[:, 0]) - self.model_input(batch)).pow(2)[:, self.patch_length:]
+            rec = se.mean(); out["loss"] = out["loss"] + self.recon_weight * rec; out["recon"] = rec.detach()
+        if self.vc_weight > 0 and self.training:
+            var, cov = self.vc_terms(batch)
+            out["loss"] = out["loss"] + self.vc_weight * (var + self.vc_cov_ratio * cov)
+            out["vc_var"] = var.detach(); out["vc_cov"] = cov.detach()
+        if self.inv_weight > 0 and self.training:
+            inv = self.inv_term(batch); out["loss"] = out["loss"] + self.inv_weight * inv; out["inv"] = inv.detach()
+        return out
+
+    @torch.no_grad()
+    def _ac_recon_scores(self, batch: torch.Tensor, mask: torch.Tensor | None):
+        """ac_score recon: (score, valid), both (B, N, G); score = squared error of the reconstruction head on the
+        horizon-1 prediction (mask hidden from the context) vs the model input, mean over the patch's time steps and
+        the group's channels; valid = patches >= 1 (and, with a mask, the hidden tokens)."""
+        pred = self._ac_forward(batch, mask)[0][:, 0]
+        se = (self.recon_from_pred(pred) - self.model_input(batch)).pow(2)
+        B, N, G, P = batch.shape[0], self.num_patches, self.n_groups, self.patch_length
+        se = se.reshape(B, N, P, -1).mean(2)                                         # (B, N, F)
+        if self.ac_score == "recon_norm":
+            se = (se - self.ac_rn_med) / self.ac_rn_scale
+        sc = torch.stack([se[:, :, getattr(self, f"gidx_{g}")].mean(-1) for g in range(G)], dim=-1)
+        v = (torch.arange(N, device=batch.device) >= 1).view(1, N, 1).expand(B, N, G)
+        if mask is not None:
+            v = v & mask
+        return sc, v
+
+    @torch.no_grad()
+    def _ac_score(self, batch: torch.Tensor) -> torch.Tensor:
+        """Window score: mean normalized token error over all groups, horizons and valid patches (nothing hidden);
+        ac_score recon: mean reconstruction error over all groups and patches >= 1 (nothing hidden)."""
+        if getattr(self, "ac_score", "token") in ("recon", "recon_norm"):
+            sc, v = self._ac_recon_scores(batch, None); v = v.float()
+            return (sc * v).sum((1, 2)) / v.sum((1, 2))
+        err = self._ac_errors(batch)[0]
+        v = self.ac_valid.unsqueeze(0).float()
+        return (err * v).sum((1, 2, 3)) / v.sum((1, 2, 3))
+
+    @torch.no_grad()
+    def _ac_val_stats(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
+        """val_stats with the horizon-1 errors of all groups at patches >= 1, nothing hidden."""
+        B = batch.shape[0]
+        err = self._ac_errors(batch)[0][:, 0]                                       # (B, N, G)
+        v = self.ac_valid[0].unsqueeze(0).expand(B, -1, -1).float()
+        tgt = F.normalize(self.target_tokens(batch), dim=-1)
+        return {"err_sum": (err * v).sum((0, 1)), "err_n": v.sum((0, 1)),
+                "t_sum": tgt.sum((0, 1)), "t_n": torch.full((self.n_groups,), float(B * self.num_patches), device=batch.device)}
 
     # ------------------------------------------------------------------
     # EMA handling
@@ -612,7 +790,10 @@ class MTSJEPA(AnomalyDetectionModel):
     @torch.no_grad()
     def token_scores(self, batch: torch.Tensor, mask: torch.Tensor):
         """(score, valid), both (B, N, G): the per-token terms of anomaly_score with `mask` hidden from the context
-        (step 1 aware; with self_head the context groups are scored at the hidden patches, as in anomaly_score)."""
+        (step 1 aware; with self_head the context groups are scored at the hidden patches, as in anomaly_score).
+        ac with ac_score recon: reconstruction error of the hidden tokens (_ac_recon_scores)."""
+        if getattr(self, "ac", False) and getattr(self, "ac_score", "token") in ("recon", "recon_norm"):
+            return self._ac_recon_scores(batch, mask)
         err, pred = self._token_errors_pred(batch, mask)
         if self.score_mode == "nll" or self.self_head_on:
             s, v, _ = self.step1_terms(batch, self.score_token_mask(mask), err, pred)
@@ -627,13 +808,13 @@ class MTSJEPA(AnomalyDetectionModel):
     def target_tokens(self, batch: torch.Tensor) -> torch.Tensor:
         """Target-encoder output per token, (B, N, G, D), not normalized."""
         B, N, G = batch.shape[0], self.num_patches, self.n_groups
-        mask = self.target_attn_mask if self.target_attn == "group" else None
+        mask = self._tgt_attn()
         return self.target_encoder(self._group_tokens(batch, target=True).reshape(B, N * G, -1), mask=mask).view(B, N, G, -1)
 
     def vc_terms(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Variance and covariance terms (see vc_weight) on the online tokens of the unmasked window."""
         B, N, G = batch.shape[0], self.num_patches, self.n_groups
-        mask = self.target_attn_mask if self.target_attn == "group" else None
+        mask = self._tgt_attn()
         was = self.context_encoder.training
         if self.vc_no_dropout:
             self.context_encoder.eval()
@@ -649,7 +830,7 @@ class MTSJEPA(AnomalyDetectionModel):
     def inv_term(self, batch: torch.Tensor) -> torch.Tensor:
         """Noise invariance term (see inv_weight) on the online tokens of the unmasked window."""
         B, N, G = batch.shape[0], self.num_patches, self.n_groups
-        mask = self.target_attn_mask if self.target_attn == "group" else None
+        mask = self._tgt_attn()
         was = self.context_encoder.training
         if self.vc_no_dropout:
             self.context_encoder.eval()
@@ -677,6 +858,8 @@ class MTSJEPA(AnomalyDetectionModel):
         """Validation statistics per group (eval mask): sum and count of the token errors of the masked tokens,
         and sum and count of the L2-normalized target tokens (for the spread of the targets, see train.py
         select_metric norm_loss)."""
+        if getattr(self, "ac", False):
+            return self._ac_val_stats(batch)
         B = batch.shape[0]
         mask = self.eval_token_mask(B, batch.device)
         err = self.token_errors(batch, mask)
@@ -685,7 +868,11 @@ class MTSJEPA(AnomalyDetectionModel):
                 "t_sum": tgt.sum((0, 1)), "t_n": torch.full((self.n_groups,), float(B * self.num_patches), device=batch.device)}
 
     def _predict_ctx(self, batch: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(predictor output, context-encoder output), both (B, N, G, D); mask (B, N, G) True = hidden."""
+        """(predictor output, context-encoder output), both (B, N, G, D); mask (B, N, G) True = hidden.
+        ac: the horizon-1 predictions (patch 0 has no context, only its action token)."""
+        if getattr(self, "ac", False):
+            preds, ctx = self._ac_forward(batch, mask)
+            return preds[:, 0], ctx
         B, N, G = mask.shape
         tok = self._group_tokens(batch, target=False)
         mtok = (self.mask_token.view(1, 1, 1, -1) + self.gpos_embed + self.group_pos).expand(B, -1, -1, -1)
@@ -777,6 +964,8 @@ class MTSJEPA(AnomalyDetectionModel):
         return self.recon_from_pred(self.predict_tokens(batch, mask)), self.model_input(batch)
 
     def training_step(self, batch: torch.Tensor) -> dict[str, torch.Tensor]:
+        if getattr(self, "ac", False):
+            return self._ac_training_step(batch)
         if self.group_tokens:
             B = batch.shape[0]
             mask = self.sample_token_mask(B, batch.device) if self.training else self.eval_token_mask(B, batch.device)
@@ -837,6 +1026,8 @@ class MTSJEPA(AnomalyDetectionModel):
     def anomaly_score(self, batch: torch.Tensor) -> torch.Tensor:
         self.eval()
         B = batch.shape[0]
+        if getattr(self, "ac", False):
+            return self._ac_score(batch)
         if self.group_tokens:
             mask = self.eval_token_mask(B, batch.device)
             if self.score_mode == "nll" or self.self_head_on:
