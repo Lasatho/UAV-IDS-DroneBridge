@@ -135,6 +135,8 @@ class MTSJEPA(AnomalyDetectionModel):
         ac_group_mask_prob: float = 0.3,
         ac_score: str = "token",
         ac_recon_norm: dict | None = None,
+        ac_use_action: bool = True,
+        ac_one_way_radio: bool = True,
     ):
         super().__init__(num_features, window_length)
         assert window_length % patch_length == 0, \
@@ -392,7 +394,8 @@ class MTSJEPA(AnomalyDetectionModel):
                 self.register_buffer(f"fw_{gi}", w)
             self.fourier_head = nn.ModuleList(nn.Sequential(nn.Linear(embed_dim, 64), nn.GELU(), nn.Linear(64, 2 * d))
                                               for _ in self.groups)
-        self._init_ac(ac, ac_action_group, ac_radio_groups, ac_horizon, ac_group_mask_prob, embed_dim)
+        self._init_ac(ac, ac_action_group, ac_radio_groups, ac_horizon, ac_group_mask_prob, embed_dim,
+                      ac_use_action, ac_one_way_radio)
         self.ac_score = str(ac_score)
         if self.ac_score not in ("token", "recon", "recon_norm"):
             raise ValueError("ac_score must be token, recon or recon_norm")
@@ -410,7 +413,8 @@ class MTSJEPA(AnomalyDetectionModel):
     # MTS-JEPA-AC (stage 1, Vault Training/entwurf_mts_jepa_ac, approved Lasse 2026-11-26)
     # ------------------------------------------------------------------
 
-    def _init_ac(self, ac, action_group, radio_groups, horizon, group_mask_prob, embed_dim):
+    def _init_ac(self, ac, action_group, radio_groups, horizon, group_mask_prob, embed_dim, use_action=True,
+                 one_way_radio=True):
         """ac (opt-in): action-conditioned, causal variant. Token order (patch n, group g) -> n * G + g.
         Context and target encoder: block-causal in time (a token sees patches <= its own), one-way radio (physical
         tokens never attend radio tokens; radio tokens may attend physical ones); the target encoder additionally only
@@ -426,7 +430,7 @@ class MTSJEPA(AnomalyDetectionModel):
         predictions; vc/inv terms as before with the causal target attention. The masked-JEPA interface
         (token_errors, predict_tokens, target_tokens, recon_values, set_scores) works with the horizon-1 predictions:
         mask = tokens hidden from the context."""
-        self.ac = bool(ac)
+        self.ac = bool(ac); self.ac_use_action = bool(use_action); self.ac_one_way_radio = bool(one_way_radio)
         if not self.ac:
             return
         if not self.group_tokens or not self.group_names:
@@ -450,7 +454,8 @@ class MTSJEPA(AnomalyDetectionModel):
         radio = torch.tensor([g in radio_groups for g in names])
         L = N * G; n_of = torch.arange(L) // G; g_of = torch.arange(L) % G
         phys_q = ~radio[g_of]; rad_k = radio[g_of]
-        ctx = (n_of.view(1, -1) > n_of.view(-1, 1)) | (phys_q.view(-1, 1) & rad_k.view(1, -1))   # True = blocked
+        ow = (phys_q.view(-1, 1) & rad_k.view(1, -1)) if self.ac_one_way_radio else torch.zeros(L, L, dtype=torch.bool)
+        ctx = (n_of.view(1, -1) > n_of.view(-1, 1)) | ow                                         # True = blocked
         self.register_buffer("ac_ctx_mask", ctx, persistent=False)
         self.register_buffer("ac_tgt_mask", ctx | (g_of.view(-1, 1) != g_of.view(1, -1)), persistent=False)
         H = self.ac_h; Q = H * N * G; T_ = L + N + Q
@@ -460,12 +465,15 @@ class MTSJEPA(AnomalyDetectionModel):
         qk = torch.arange(Q) // (N * G); qn = (torch.arange(Q) // G) % N; qg = torch.arange(Q) % G
         qphys = ~radio[qg]
         cut = qn - (qk + 1)                                        # last context patch of the query
-        m[L + N:, :L] = (n_of.view(1, -1) > cut.view(-1, 1)) | (qphys.view(-1, 1) & rad_k.view(1, -1))
+        m[L + N:, :L] = (n_of.view(1, -1) > cut.view(-1, 1)) | ((qphys.view(-1, 1) & rad_k.view(1, -1))
+                                                                if self.ac_one_way_radio else False)
         an = torch.arange(N)
         last_act = torch.where(qg == self.ac_a, qn - 1, qn)        # the command itself is not given to its own query
         m[L + N:, L:L + N] = ~((an.view(1, -1) > cut.view(-1, 1)) & (an.view(1, -1) <= last_act.view(-1, 1)))
+        if not self.ac_use_action:
+            m[L + N:, L:L + N] = True                              # ablation: queries see no action tokens
         same = (qk.view(-1, 1) == qk.view(1, -1)) & (qn.view(-1, 1) == qn.view(1, -1))
-        m[L + N:, L + N:] = ~same | (qphys.view(-1, 1) & radio[qg].view(1, -1))
+        m[L + N:, L + N:] = ~same | ((qphys.view(-1, 1) & radio[qg].view(1, -1)) if self.ac_one_way_radio else False)
         assert not m.all(1).any(), "a token without any key"
         self.register_buffer("ac_pred_mask", m, persistent=False)
         valid = torch.arange(N).view(1, N, 1) >= torch.arange(1, H + 1).view(H, 1, 1)  # (H, N, 1): m >= k
