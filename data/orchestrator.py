@@ -1436,6 +1436,11 @@ class Orchestrator:
                 # (min 60s flight is enforced) and after the attack.
                 attack_start_offset = rng.uniform(15, 45)
                 attack_duration = rng.uniform(15, 40)
+                # Spoofing drift-rate study (2026-11-22): variant "lua:rate=<m/s>:target=<m>" fixes the offset the
+                # attacker reaches; the duration follows as target / rate (start offset still from the seed).
+                if attack_variant and str(attack_variant).startswith("lua:"):
+                    kv = dict(x.split("=") for x in str(attack_variant)[4:].split(":"))
+                    attack_duration = float(kv["target"]) / float(kv["rate"])
                 log.info(f"  Attack scheduled: {attack_type}, "
                          f"offset={attack_start_offset:.0f}s, "
                          f"duration={attack_duration:.0f}s "
