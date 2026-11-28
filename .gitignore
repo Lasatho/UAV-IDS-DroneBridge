@@ -45,6 +45,8 @@ Thumbs.db
 # data/ — track scripts and docs, ignore generated output
 data/**
 !data/*.py
+!data/attacks/
+!data/attacks/*.py
 !data/README.md
 !data/.gitkeep
 
